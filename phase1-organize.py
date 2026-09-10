@@ -1,16 +1,50 @@
 """
-Phase 1: Photo Organizer
-Sorts photos into a Year/Month/Day directory structure based on EXIF
-"Date Taken" metadata, falling back to file modification time when
-EXIF data is missing or unreadable.
+Photo Organizer — Phase 1 (of 3)
+==================================
 
-Also computes a SHA1 checksum for each file to catch exact duplicates
-(byte-identical files are deleted rather than moved, keeping the first
-copy encountered) and a perceptual hash (pHash) for near-duplicate
-detection in a later phase. Both hashes are persisted to a SQLite DB
-so re-runs don't need to re-hash already-processed files.
+PROJECT GOAL
+    Organize a large photo collection by:
+      1. Organizing   - sort photos into a Year/Month/Day directory structure
+      2. Deduplicating - identify and remove duplicate images, preserving EXIF
+      3. Cleaning      - identify and group/remove visually similar photos
 
-Supports: .jpg, .jpeg, .png, .heic, .tiff, .raw, .dng
+PROJECT SCOPE
+    - Recursive scan of the source directory, any nesting depth
+    - Formats: .jpg, .jpeg, .png, .heic, .tiff, .raw, .dng
+    - Video files: scanned, but explicitly excluded from deduplication
+    - Archives (.zip, .tar.gz, etc.) and non-image files: ignored
+    - Google Takeout archives: out of scope (JSON metadata parsing not handled)
+
+THIS SCRIPT'S STATUS (Phase 1 — Organization)
+    Done:
+      - Recursive scan, sorts into Year/Month/Day using EXIF "Date Taken"
+      - Falls back to file modification time when EXIF is missing/unreadable
+      - Duplicate-filename safety: never overwrites, appends a numeric suffix
+      - SHA1 checksum per file; exact (byte-identical) duplicates are deleted
+        rather than moved, keeping the first copy encountered
+      - Perceptual hash (pHash) computed and stored per file for Phase 3's
+        near-duplicate grouping, but NOT acted on here (no fuzzy-match
+        deletions happen in this phase)
+      - SHA1/pHash persisted to a SQLite DB so re-runs don't re-hash files
+        already processed in a prior --live run
+      - Dry-run by default; --live required to actually move/delete anything
+
+    Not yet done (future phases):
+      - Video file handling
+      - Google Takeout support
+      - Phase 3: acting on perceptual-hash similarity to group/remove
+        near-duplicates (visually similar but not byte-identical)
+
+Required libraries:
+    pip install Pillow          # core image handling (required)
+
+Optional libraries (script runs without them, with reduced functionality):
+    pip install pillow-heif     # enables EXIF reads for .heic files
+    pip install exifread        # enables EXIF reads for .raw / .dng files
+    pip install imagehash       # enables perceptual hash (pHash) computation
+
+Standard library only (no install needed): os, shutil, logging, argparse,
+hashlib, sqlite3, datetime, pathlib
 """
 
 import os
