@@ -1,447 +1,461 @@
 """
-Photo Organizer — Phase 1 (of 3)
-==================================
+Project: LensLogic (Phase 1: Core Engine)
+Description: A backend engine for organizing large photo collections based on spec.
 
-PROJECT GOAL
-    Organize a large photo collection by:
-      1. Organizing   - sort photos into a Year/Month/Day directory structure
-      2. Deduplicating - identify and remove duplicate images, preserving EXIF
-      3. Cleaning      - identify and group/remove visually similar photos
+Runtime Arguments:
+- --source <path>  (Optional) Path to unorganized source directory (default: "/data/source").
+- --dest <path>    (Optional) Path for organized output directory (default: "/data/dest").
+- --base <path>    (Optional) Base directory for app artifacts (default: "/data").
+                              Creates/uses <base>/db/ for SQLite and <base>/logs/ for logs.
+- --live           (Optional) Flag to execute physical Copy-Verify-Delete operations.
+                              Defaults to Dry Run mode if omitted (no files moved/deleted).
 
-PROJECT SCOPE
-    - Recursive scan of the source directory, any nesting depth
-    - Formats: .jpg, .jpeg, .png, .heic, .tiff, .raw, .dng
-    - Video files: scanned, but explicitly excluded from deduplication
-    - Archives (.zip, .tar.gz, etc.) and non-image files: ignored
-    - Google Takeout archives: out of scope (JSON metadata parsing not handled)
-
-THIS SCRIPT'S STATUS (Phase 1 — Organization)
-    Done:
-      - Recursive scan, sorts into Year/Month/Day using EXIF "Date Taken"
-      - Falls back to file modification time when EXIF is missing/unreadable
-      - Duplicate-filename safety: never overwrites, appends a numeric suffix
-      - SHA1 checksum per file; exact (byte-identical) duplicates are deleted
-        rather than moved, keeping the first copy encountered
-      - Perceptual hash (pHash) computed and stored per file for Phase 3's
-        near-duplicate grouping, but NOT acted on here (no fuzzy-match
-        deletions happen in this phase)
-      - SHA1/pHash persisted to a SQLite DB so re-runs don't re-hash files
-        already processed in a prior --live run
-      - Interruption-safe moves: files are copied to a temp name, verified
-        by hash, then atomically renamed into place before the source is
-        deleted — a crash mid-copy never leaves a corrupt/partial file
-        visible under its final filename
-      - Destination-side duplicate check: even if a --live run is
-        interrupted before its DB write completes, a rescan detects the
-        already-moved file by content (not just by DB lookup) and treats
-        the leftover source copy as a duplicate instead of creating a
-        redundant "_1" copy
-      - Dry-run by default; --live required to actually move/delete anything
-
-    Not yet done (future phases):
-      - Video file handling
-      - Google Takeout support
-      - Phase 3: acting on perceptual-hash similarity to group/remove
-        near-duplicates (visually similar but not byte-identical)
-
-Required libraries:
-    pip install Pillow          # core image handling (required)
-
-Optional libraries (script runs without them, with reduced functionality):
-    pip install pillow-heif     # enables EXIF reads for .heic files
-    pip install exifread        # enables EXIF reads for .raw / .dng files
-    pip install imagehash       # enables perceptual hash (pHash) computation
-
-Standard library only (no install needed): os, shutil, logging, argparse,
-hashlib, sqlite3, datetime, pathlib
+System & Python Dependencies:
+- System Binary:
+    - ExifTool (must be installed on host system and available in PATH)
+      Linux: sudo apt install exiftool
+      macOS: brew install exiftool
+      Windows: choco install exiftool
+- Python Packages:
+    pip install Pillow imagehash pillow-heif
 """
 
-import os
-import shutil
-import logging
 import argparse
 import hashlib
+import json
+import logging
+import os
+import shutil
 import sqlite3
+import subprocess
+import sys
+import threading
+import queue
+import time
 from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
-from PIL import Image
+from concurrent.futures import ProcessPoolExecutor
+from typing import Optional, Callable, Any
 
-# Optional: HEIC support. Falls back gracefully if the plugin isn't installed.
-try:
-    import pillow_heif
-    pillow_heif.register_heif_opener()
-    HEIC_SUPPORTED = True
-except ImportError:
-    HEIC_SUPPORTED = False
+# --- Configuration & Constants ---
+MAX_WORKER_PROCESSES = os.cpu_count() or 4
+DB_QUEUE_SIZE = 1000
+SHA1_CHUNK_SIZE = 65536
+MAX_RETRIES = 3
+INITIAL_RETRY_DELAY = 1.0  # Seconds
 
-# Optional: RAW/DNG support via exifread (lighter than rawpy, EXIF-only).
-try:
-    import exifread
-    EXIFREAD_SUPPORTED = True
-except ImportError:
-    EXIFREAD_SUPPORTED = False
+SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.tiff', '.raw', '.dng', '.cr2', '.nef', '.arw', '.raf'}
+PARTIAL_SUFFIX = ".organizing.partial"
 
-# Optional: perceptual hashing, for Phase 3's near-duplicate grouping.
-# Computed now (while every file is already being opened) but not acted on.
+# --- Dependency Check ---
 try:
     import imagehash
     IMAGEHASH_SUPPORTED = True
 except ImportError:
     IMAGEHASH_SUPPORTED = False
 
-SHA1_CHUNK_SIZE = 65536
+try:
+    from PIL import Image
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+    except ImportError:
+        pass
+    PIL_SUPPORTED = True
+except ImportError:
+    PIL_SUPPORTED = False
 
-SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.tiff', '.raw', '.dng'}
-RAW_EXTENSIONS = {'.raw', '.dng'}  # formats PIL can't open directly
+# --- Data Models ---
+@dataclass
+class ProcessingResult:
+    """Container for data gathered by the Producer process."""
+    file_path: str
+    sha1_hash: str
+    phash: str
+    metadata: dict
+    status: str
+    dest_path: str
+    collision_group: Optional[int] = None
+    is_master: bool = False
 
-# EXIF tags that may hold the "date taken" value, in priority order.
-DATE_TAGS_PIL = (36867, 36868, 306)  # DateTimeOriginal, DateTimeDigitized, DateTime
-EXIFREAD_TAG_KEYS = (
-    'EXIF DateTimeOriginal',
-    'EXIF DateTimeDigitized',
-    'Image DateTime',
-)
+# --- Producer-Consumer Queue ---
+result_queue = queue.Queue(maxsize=DB_QUEUE_SIZE)
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-logger = logging.getLogger(__name__)
+# --- Logging Initialization ---
+def configure_logging(log_dir: Path):
+    """Configures logging to output to console and base/logs/organizer.log."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "organizer.log"
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] (%(threadName)s) %(message)s',
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(log_file, mode="a", encoding="utf-8")
+        ]
+    )
 
-def parse_exif_date(value):
-    """Parse an EXIF date string ('YYYY:MM:DD HH:MM:SS') into a datetime."""
+logger = logging.getLogger("LensLogic")
+
+# --- Resilient Network IO Wrapper ---
+def retry_io_operation(action_description: str, func: Callable[..., Any], *args, **kwargs) -> Any:
+    """Executes an IO function with exponential backoff to handle transient network share issues."""
+    delay = INITIAL_RETRY_DELAY
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return func(*args, **kwargs)
+        except (OSError, PermissionError, IOError) as e:
+            if attempt == MAX_RETRIES:
+                logger.error(f"IO Operation failed after {MAX_RETRIES} attempts [{action_description}]: {e}")
+                raise e
+            logger.warning(f"Transient IO error during [{action_description}]: {e}. Retrying in {delay:.1f}s (Attempt {attempt}/{MAX_RETRIES})...")
+            time.sleep(delay)
+            delay *= 2.0
+
+# --- SQLite Connection Helper ---
+def get_db_connection(db_path: str) -> sqlite3.Connection:
+    """Creates a connection with WAL mode enabled and an extended busy timeout for concurrent safety."""
+    conn = sqlite3.connect(db_path, timeout=10.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    return conn
+
+# --- Database Consumer (Thread) ---
+def db_writer_worker(db_path: str):
+    """The Consumer: Only this thread interacts with the SQLite database during scanning."""
+    conn = get_db_connection(db_path)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS photos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_path TEXT UNIQUE,
+            dest_path TEXT,
+            sha1_hash TEXT,
+            phash TEXT,
+            collision_group INTEGER,
+            is_master BOOLEAN DEFAULT 0,
+            status TEXT,
+            metadata_json TEXT
+        )
+    """)
+    conn.commit()
+
+    logger.info("Database worker thread started.")
+    while True:
+        result = result_queue.get()
+        if result is None:
+            break
+        
+        cursor.execute("SELECT id FROM photos WHERE sha1_hash = ?", (result.sha1_hash,))
+        existing = cursor.fetchone()
+        
+        status = result.status
+        if existing and status != "Failed":
+            status = "Duplicate"
+
+        cursor.execute(
+            """INSERT INTO photos 
+               (source_path, dest_path, sha1_hash, phash, collision_group, is_master, status, metadata_json) 
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                result.file_path, 
+                result.dest_path, 
+                result.sha1_hash, 
+                result.phash, 
+                result.collision_group,
+                1 if result.is_master else 0,
+                status, 
+                json.dumps(result.metadata)
+            )
+        )
+        conn.commit()
+        result_queue.task_done()
+        
+    conn.close()
+    logger.info("Database worker thread shut down cleanly.")
+
+# --- Startup Recovery & Reconciliation ---
+def reconcile_interrupted_state(db_path: Path):
+    """Scans for leftover partials or uncommitted state from crashes prior to run."""
+    if not db_path.exists():
+        return
+
+    logger.info("Checking database for interrupted tasks from previous runs...")
+    conn = get_db_connection(str(db_path))
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='photos';")
+        if not cursor.fetchone():
+            conn.close()
+            return
+
+        cursor.execute("SELECT id, source_path, dest_path FROM photos WHERE status = 'Processing'")
+        stuck_records = cursor.fetchall()
+
+        for record_id, src_str, dst_str in stuck_records:
+            src = Path(src_str)
+            dst = Path(dst_str)
+            partial = Path(dst_str + PARTIAL_SUFFIX)
+
+            if partial.exists():
+                logger.warning(f"Found orphaned partial file: {partial.name}. Removing.")
+                partial.unlink()
+
+            if dst.exists() and not src.exists():
+                logger.info(f"Reconciled completed move for record {record_id}: {dst.name}")
+                cursor.execute("UPDATE photos SET status = 'Completed' WHERE id = ?", (record_id,))
+            else:
+                logger.info(f"Resetting interrupted record {record_id} to Pending.")
+                cursor.execute("UPDATE photos SET status = 'Pending' WHERE id = ?", (record_id,))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error during startup state reconciliation: {e}")
+    finally:
+        conn.close()
+
+# --- Pre-Flight Space Validation ---
+def verify_sufficient_disk_space(dest_path: Path, required_bytes: int, safety_margin_mb: int = 500) -> bool:
+    """Checks if the destination directory volume has sufficient space available."""
+    check_dir = dest_path if dest_path.exists() else dest_path.parent
+    check_dir.mkdir(parents=True, exist_ok=True)
+
+    stat = shutil.disk_usage(check_dir)
+    buffer_bytes = safety_margin_mb * 1024 * 1024
+    total_needed = required_bytes + buffer_bytes
+
+    if stat.free < total_needed:
+        required_gb = required_bytes / (1024**3)
+        free_gb = stat.free / (1024**3)
+        logger.error(
+            f"Insufficient disk space on destination! "
+            f"Required: {required_gb:.2f} GB (+{safety_margin_mb}MB safety buffer), "
+            f"Available: {free_gb:.2f} GB."
+        )
+        return False
+    return True
+
+# --- Helper Functions ---
+def parse_exif_date(value: str) -> Optional[datetime]:
     try:
         return datetime.strptime(str(value)[:19], '%Y:%m:%d %H:%M:%S')
     except (ValueError, TypeError):
         return None
 
-
-def get_date_from_exif(file_path, ext):
-    """
-    Attempts to extract 'Date Taken' from EXIF data.
-    Uses PIL for formats it understands natively (jpg, png, tiff, heic-with-plugin).
-    Falls back to exifread for RAW/DNG, which PIL cannot open.
-    Returns a datetime object, or None if not found/unreadable.
-    """
-    # RAW/DNG: PIL can't open these, so go straight to exifread if available.
-    if ext in RAW_EXTENSIONS:
-        if not EXIFREAD_SUPPORTED:
-            return None
-        try:
-            with open(file_path, 'rb') as f:
-                tags = exifread.process_file(f, details=False, stop_tag='EXIF DateTimeOriginal')
-            for key in EXIFREAD_TAG_KEYS:
-                if key in tags:
-                    return parse_exif_date(tags[key])
-        except Exception as e:
-            logger.debug(f"exifread failed on {file_path.name}: {e}")
-        return None
-
-    # HEIC without the plugin registered: PIL.Image.open() will raise.
-    if ext == '.heic' and not HEIC_SUPPORTED:
-        return None
-
+def get_date_from_exiftool(file_path: Path) -> Optional[datetime]:
     try:
-        with Image.open(file_path) as img:
-            exif_data = img.getexif()
-            if exif_data:
-                for tag in DATE_TAGS_PIL:
-                    if tag in exif_data:
-                        parsed = parse_exif_date(exif_data[tag])
-                        if parsed:
-                            return parsed
+        cmd = ['exiftool', '-s3', '-DateTimeOriginal', '-CreateDate', '-DateTime', str(file_path)]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        if res.returncode == 0 and res.stdout.strip():
+            raw_date_str = res.stdout.splitlines()[0].strip()
+            parsed = parse_exif_date(raw_date_str)
+            if parsed:
+                return parsed
     except Exception as e:
-        logger.debug(f"PIL EXIF read failed on {file_path.name}: {e}")
-
+        logger.debug(f"ExifTool execution failed for {file_path.name}: {e}")
     return None
 
+def get_date_from_exif(file_path: Path) -> Optional[datetime]:
+    dt = get_date_from_exiftool(file_path)
+    if dt:
+        return dt
 
-def get_fallback_date(file_path):
-    """Falls back to the file's modification time."""
-    return datetime.fromtimestamp(os.path.getmtime(file_path))
+    if PIL_SUPPORTED:
+        try:
+            with Image.open(file_path) as img:
+                exif_data = img.getexif()
+                if exif_data:
+                    for tag in (36867, 36868, 306):
+                        if tag in exif_data:
+                            parsed = parse_exif_date(exif_data[tag])
+                            if parsed: return parsed
+        except Exception as e:
+            logger.debug(f"PIL EXIF read failed on {file_path.name}: {e}")
+            
+    return None
 
+def compute_sha1(file_path: str) -> str:
+    def _hash():
+        h = hashlib.sha1()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(SHA1_CHUNK_SIZE), b''):
+                h.update(chunk)
+        return h.hexdigest()
+    return retry_io_operation(f"SHA1 Hash {file_path}", _hash)
 
-def compute_sha1(file_path):
-    """Streams the file in chunks and returns its SHA1 hex digest."""
-    h = hashlib.sha1()
-    with open(file_path, 'rb') as f:
-        for chunk in iter(lambda: f.read(SHA1_CHUNK_SIZE), b''):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def compute_phash(file_path, ext):
-    """
-    Computes a perceptual hash (pHash) for near-duplicate detection later.
-    Best-effort: returns None for formats that can't be opened as an image
-    (RAW/DNG, or HEIC without the plugin) or if imagehash isn't installed.
-    This value is stored but NOT used for any deletion decision in Phase 1.
-    """
-    if not IMAGEHASH_SUPPORTED:
-        return None
-    if ext in RAW_EXTENSIONS:
-        return None
-    if ext == '.heic' and not HEIC_SUPPORTED:
-        return None
+def compute_phash(file_path: str) -> str:
+    if not (IMAGEHASH_SUPPORTED and PIL_SUPPORTED):
+        return "not_supported"
     try:
         with Image.open(file_path) as img:
             return str(imagehash.phash(img))
-    except Exception as e:
-        logger.debug(f"pHash failed on {file_path.name}: {e}")
-        return None
+    except Exception:
+        return "error"
 
-
-def init_db(db_path):
-    """Creates (if needed) the SQLite DB used to track hashes across runs."""
-    conn = sqlite3.connect(db_path)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS photos (
-            sha1 TEXT PRIMARY KEY,
-            phash TEXT,
-            original_path TEXT NOT NULL,
-            final_path TEXT NOT NULL,
-            date_taken TEXT,
-            processed_at TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    return conn
-
-
-def lookup_sha1(conn, sha1):
-    """Returns the stored row for a hash if this file was already processed, else None."""
-    cur = conn.execute("SELECT final_path FROM photos WHERE sha1 = ?", (sha1,))
-    return cur.fetchone()
-
-
-def record_photo(conn, sha1, phash, original_path, final_path, date_taken):
-    conn.execute(
-        "INSERT OR REPLACE INTO photos (sha1, phash, original_path, final_path, date_taken, processed_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (sha1, phash, str(original_path), str(final_path), date_taken.isoformat(), datetime.now().isoformat()),
-    )
-    conn.commit()
-
-
-def get_unique_path(target_path):
-    """If a file with the same name exists, appends a counter (image_1.jpg, image_2.jpg, ...)."""
+def get_unique_dest_path(target_path: Path) -> Path:
     if not target_path.exists():
         return target_path
-
-    parent = target_path.parent
-    stem = target_path.stem
-    suffix = target_path.suffix
-
     counter = 1
-    while True:
-        new_path = parent / f"{stem}_{counter}{suffix}"
-        if not new_path.exists():
-            return new_path
+    while target_path.exists():
+        target_path = target_path.parent / f"{target_path.stem}_{counter}{target_path.suffix}"
         counter += 1
+    return target_path
 
-
-PARTIAL_SUFFIX = ".organizing.partial"
-
-
-def clean_orphaned_partials(dest_root):
-    """
-    Removes leftover .organizing.partial temp files from a prior run that was
-    interrupted mid-copy. Safe to run at the start of every --live run: a
-    .partial file is only ever a half-written copy, never a finished photo,
-    so any one found here means an earlier run died before it could finalize.
-    """
-    found = list(dest_root.rglob(f"*{PARTIAL_SUFFIX}"))
-    for partial in found:
-        logger.warning(f"Removing orphaned partial file from an interrupted prior run: {partial}")
-        partial.unlink()
-    return len(found)
-
-
-def safe_move(src_path, final_path, expected_sha1):
-    """
-    Moves src_path to final_path without ever leaving a partial/corrupt file
-    visible under the final filename, even if interrupted mid-copy.
-
-    Sequence: copy to a same-directory temp file -> verify its hash matches
-    the source -> atomically rename temp -> final (os.replace is atomic on
-    the same filesystem) -> only THEN delete the source.
-
-    If interrupted:
-      - before the atomic rename: final_path never existed; a .partial file
-        may be left behind, cleaned up by clean_orphaned_partials() next run.
-      - after the atomic rename but before the source delete: final_path is
-        a complete, verified file; the source is simply reprocessed on the
-        next run and caught as a duplicate by the destination-side check in
-        organize_photos() below, even if the DB write never happened.
-    """
-    temp_path = final_path.with_name(final_path.name + PARTIAL_SUFFIX)
-    shutil.copy2(str(src_path), str(temp_path))
-
-    if compute_sha1(temp_path) != expected_sha1:
-        temp_path.unlink(missing_ok=True)
-        raise IOError(f"Copy verification failed for {src_path} -> {temp_path}; source left untouched.")
-
-    os.replace(str(temp_path), str(final_path))  # atomic within the same directory/filesystem
-    src_path.unlink()
-
-
-def resolve_target_path(target_dir, file_name, sha1):
-    """
-    Decides where a file should land, handling three cases:
-      - no collision: use the plain target path
-      - a file with the same name already exists at the destination AND has
-        the same content (sha1 match) -> this is a duplicate, most likely
-        left over from an interrupted prior run whose DB write never
-        happened. Returns None to signal "treat as duplicate, don't move."
-      - a file with the same name exists but different content -> genuinely
-        different photo that happens to share a filename; fall back to the
-        counter-suffix renaming in get_unique_path().
-    This filesystem-level check means duplicate detection still works
-    correctly across an interrupted run even if the SQLite record for the
-    earlier copy was never written.
-    """
-    candidate = target_dir / file_name
-    if not candidate.exists():
-        return candidate
-
-    if compute_sha1(candidate) == sha1:
-        return None
-
-    return get_unique_path(candidate)
-
-
-def organize_photos(source_dir, dest_dir, db_path, dry_run=True):
-    src_root = Path(source_dir).expanduser().resolve()
-    dest_root = Path(dest_dir).expanduser().resolve()
-
-    if not src_root.exists():
-        logger.error(f"Source directory {src_root} does not exist.")
-        return
-
-    if not dry_run:
-        dest_root.mkdir(parents=True, exist_ok=True)
-        cleaned = clean_orphaned_partials(dest_root)
-        if cleaned:
-            logger.info(f"Cleaned up {cleaned} orphaned partial file(s) from an interrupted prior run.")
-
-    conn = init_db(db_path)
-
-    logger.info("DRY RUN MODE" if dry_run else "LIVE MODE")
-    logger.info(f"Scanning: {src_root}")
-    logger.info(f"Hash DB: {Path(db_path).resolve()}")
-    if not HEIC_SUPPORTED:
-        logger.warning("pillow-heif not installed — .heic files will use fallback date only.")
-    if not EXIFREAD_SUPPORTED:
-        logger.warning("exifread not installed — .raw/.dng files will use fallback date only.")
-    if not IMAGEHASH_SUPPORTED:
-        logger.warning("imagehash not installed — perceptual hashes will not be computed.")
-
-    count_moved = 0
-    count_exif_hits = 0
-    count_fallback = 0
-    count_duplicates = 0
-    count_errors = 0
-
-    # Dry runs never touch the DB (so you can preview repeatedly without side
-    # effects). Duplicates *within* a single dry-run scan are still caught
-    # using this in-memory map; only a --live run persists hashes to SQLite.
-    session_hashes = {}
+# --- Copy-Verify-Delete Core Protocol ---
+def copy_verify_delete(source_str: str, dest_str: str) -> bool:
+    source = Path(source_str)
+    dest = Path(dest_str)
+    partial_dest = Path(dest_str + PARTIAL_SUFFIX)
 
     try:
-        for file_path in src_root.rglob('*'):
-            if not file_path.is_file():
-                continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
 
-            ext = file_path.suffix.lower()
-            if ext not in SUPPORTED_EXTENSIONS:
-                continue
-            if file_path.name.endswith(PARTIAL_SUFFIX):
-                continue  # a leftover temp file, shouldn't normally appear under src_root
+        retry_io_operation(f"Copying {source.name}", shutil.copy2, source, partial_dest)
 
+        src_sha1 = compute_sha1(str(source))
+        partial_sha1 = compute_sha1(str(partial_dest))
+
+        if src_sha1 != partial_sha1:
+            logger.error(f"SHA1 mismatch during verification for {source.name}. Aborting move.")
+            if partial_dest.exists():
+                partial_dest.unlink()
+            return False
+
+        retry_io_operation(f"Rename partial {partial_dest.name}", partial_dest.rename, dest)
+        retry_io_operation(f"Delete original {source.name}", source.unlink)
+        logger.info(f"Successfully migrated: {source.name} -> {dest}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed transactional move for {source_str}: {e}")
+        if partial_dest.exists():
             try:
-                sha1 = compute_sha1(file_path)
+                partial_dest.unlink()
+            except Exception:
+                pass
+        return False
 
-                # Exact duplicate of a file already processed (this run or, for
-                # --live runs, a prior run recorded in the DB)?
-                existing_path = session_hashes.get(sha1)
-                if not existing_path and not dry_run:
-                    row = lookup_sha1(conn, sha1)
-                    existing_path = row[0] if row else None
+# --- Processing Worker ---
+def process_file_task(file_path_str: str, dest_base_path: str) -> ProcessingResult:
+    file_path = Path(file_path_str)
 
-                if existing_path:
-                    count_duplicates += 1
-                    if dry_run:
-                        logger.info(f"[DRY RUN] Would delete exact duplicate: {file_path} (matches {existing_path})")
-                    else:
-                        file_path.unlink()
-                        logger.info(f"Deleted exact duplicate: {file_path} (matches {existing_path})")
-                    continue
+    sha1 = compute_sha1(str(file_path))
+    phash = compute_phash(str(file_path))
 
-                date_obj = get_date_from_exif(file_path, ext)
-                if date_obj:
-                    count_exif_hits += 1
-                else:
-                    date_obj = get_fallback_date(file_path)
-                    count_fallback += 1
+    dt = get_date_from_exif(file_path)
+    if not dt:
+        dt = datetime.fromtimestamp(os.path.getmtime(file_path))
 
-                phash = compute_phash(file_path, ext)
+    year_dir = dt.strftime("%Y")
+    month_dir = dt.strftime("%m")
+    target_folder = Path(dest_base_path) / year_dir / month_dir
+    
+    initial_dest = target_folder / file_path.name
+    final_dest = get_unique_dest_path(initial_dest)
 
-                target_dir = dest_root / date_obj.strftime('%Y') / date_obj.strftime('%m') / date_obj.strftime('%d')
-
-                if dry_run:
-                    # No filesystem writes have happened yet in this preview, so
-                    # just use the simple name-collision check.
-                    final_path = get_unique_path(target_dir / file_path.name)
-                    logger.info(f"[DRY RUN] Would move: {file_path.name} -> {final_path}")
-                    session_hashes[sha1] = str(final_path)
-                else:
-                    final_path = resolve_target_path(target_dir, file_path.name, sha1)
-                    if final_path is None:
-                        # Byte-identical file already sitting at the destination —
-                        # most likely from an interrupted prior run whose DB
-                        # write never completed. Treat exactly like a duplicate.
-                        count_duplicates += 1
-                        file_path.unlink()
-                        logger.info(
-                            f"Deleted exact duplicate: {file_path} "
-                            f"(matches existing file at {target_dir / file_path.name})"
-                        )
-                        continue
-
-                    target_dir.mkdir(parents=True, exist_ok=True)
-                    safe_move(file_path, final_path, sha1)
-                    logger.info(f"Moved: {file_path.name} -> {final_path}")
-                    record_photo(conn, sha1, phash, file_path, final_path, date_obj)
-                    count_moved += 1
-
-            except Exception as e:
-                count_errors += 1
-                logger.error(f"Failed to process {file_path}: {e}")
-    finally:
-        conn.close()
-
-    logger.info("Process complete.")
-    logger.info(
-        f"EXIF date found: {count_exif_hits} | Fallback to mtime: {count_fallback} | "
-        f"Exact duplicates: {count_duplicates} | Errors: {count_errors}"
+    return ProcessingResult(
+        file_path=str(file_path),
+        sha1_hash=sha1,
+        phash=phash,
+        metadata={"date_taken": dt.isoformat()},
+        status="Pending",
+        dest_path=str(final_dest)
     )
-    if dry_run:
-        logger.info("No files were moved or deleted. Re-run with --live to perform the changes.")
-    else:
-        logger.info(f"Successfully moved {count_moved} images, deleted {count_duplicates} exact duplicates.")
 
-
+# --- Main Execution ---
 def main():
-    parser = argparse.ArgumentParser(description="Organize photos into a Year/Month/Day structure.")
-    parser.add_argument("--source", help="Path to your source photos.")
-    parser.add_argument("--dest", help="Path for the new organized structure.")
-    parser.add_argument("--live", action="store_true", help="Actually move files. Omit for a dry run.")
-    parser.add_argument("--db", default="photo_hashes.db", help="Path to the SQLite hash DB (default: photo_hashes.db).")
+    parser = argparse.ArgumentParser(description="LensLogic - Photo Collection Organizer (Phase 1 Engine)")
+    parser.add_argument("--source", default="/data/source", help="Path to source directory (default: /data/source).")
+    parser.add_argument("--dest", default="/data/dest", help="Path to destination directory (default: /data/dest).")
+    parser.add_argument("--base", default="/appdata", help="Base directory for DB and logs (default: /appdata).")
+    parser.add_argument("--live", action="store_true", help="Execute physical migration (Copy-Verify-Delete). Default is Dry Run.")
     args = parser.parse_args()
 
-    source = args.source or input("Enter the path to your source photos: ").strip()
-    dest = args.dest or input("Enter the path for the new organized structure: ").strip()
+    # 1. Resolve Base Path & Setup Subdirectories
+    base_dir = Path(args.base).resolve()
+    db_dir = base_dir / "db"
+    log_dir = base_dir / "logs"
 
-    organize_photos(source, dest, db_path=args.db, dry_run=not args.live)
+    db_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
 
+    db_path = db_dir / "photo_hashes.db"
+
+    # 2. Configure Logging
+    configure_logging(log_dir)
+
+    source_path = Path(args.source).resolve()
+    dest_path = Path(args.dest).resolve()
+
+    if not source_path.exists():
+        logger.error(f"Source path does not exist: {source_path}")
+        return
+
+    logger.info(f"Initializing LensLogic Engine. Base Directory: {base_dir}")
+    logger.info(f"Source Directory: {source_path}")
+    logger.info(f"Destination Directory: {dest_path}")
+    logger.info(f"Database Path: {db_path}")
+
+    # 3. Startup Recovery Protocol
+    reconcile_interrupted_state(db_path)
+
+    # 4. Start DB Writer Thread
+    db_thread = threading.Thread(target=db_writer_worker, args=(str(db_path),), daemon=True)
+    db_thread.start()
+
+    files_to_process = [
+        str(p) for p in source_path.rglob('*') 
+        if p.is_file() and not p.is_symlink() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+    ]
+    logger.info(f"Discovered {len(files_to_process)} supported photo/image files to scan.")
+
+    with ProcessPoolExecutor(max_workers=MAX_WORKER_PROCESSES) as executor:
+        futures = [executor.submit(process_file_task, f, str(dest_path)) for f in files_to_process]
+        for future in futures:
+            res = future.result()
+            result_queue.put(res)
+
+    result_queue.join()
+    result_queue.put(None)
+    db_thread.join()
+
+    logger.info("Scan and Dry-Run indexing completed successfully. Database updated.")
+
+    if args.live:
+        logger.info("Live Mode enabled. Initiating Pre-flight Space Checks...")
+        conn = get_db_connection(str(db_path))
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT id, source_path, dest_path FROM photos WHERE status = 'Pending'")
+        pending_records = cursor.fetchall()
+
+        total_bytes_needed = sum(
+            Path(src[1]).stat().st_size for src in pending_records if Path(src[1]).exists()
+        )
+
+        if not verify_sufficient_disk_space(dest_path, total_bytes_needed):
+            logger.error("Aborting migration due to insufficient space on destination drive.")
+            conn.close()
+            return
+
+        logger.info(f"Disk space verified. Moving {len(pending_records)} items ({total_bytes_needed / (1024**2):.2f} MB)...")
+
+        for record_id, src, dst in pending_records:
+            cursor.execute("UPDATE photos SET status = 'Processing' WHERE id = ?", (record_id,))
+            conn.commit()
+
+            success = copy_verify_delete(src, dst)
+            final_status = "Completed" if success else "Failed"
+
+            cursor.execute("UPDATE photos SET status = ? WHERE id = ?", (final_status, record_id))
+            conn.commit()
+
+        conn.close()
+        logger.info("All live file migration operations finished.")
+    else:
+        logger.info("Dry Run finished. Pass the `--live` flag to commit and move files.")
 
 if __name__ == "__main__":
     main()
