@@ -27,6 +27,15 @@ THIS SCRIPT'S STATUS (Phase 1 — Organization)
         deletions happen in this phase)
       - SHA1/pHash persisted to a SQLite DB so re-runs don't re-hash files
         already processed in a prior --live run
+      - Interruption-safe moves: files are copied to a temp name, verified
+        by hash, then atomically renamed into place before the source is
+        deleted — a crash mid-copy never leaves a corrupt/partial file
+        visible under its final filename
+      - Destination-side duplicate check: even if a --live run is
+        interrupted before its DB write completes, a rescan detects the
+        already-moved file by content (not just by DB lookup) and treats
+        the leftover source copy as a duplicate instead of creating a
+        redundant "_1" copy
       - Dry-run by default; --live required to actually move/delete anything
 
     Not yet done (future phases):
@@ -229,6 +238,76 @@ def get_unique_path(target_path):
         counter += 1
 
 
+PARTIAL_SUFFIX = ".organizing.partial"
+
+
+def clean_orphaned_partials(dest_root):
+    """
+    Removes leftover .organizing.partial temp files from a prior run that was
+    interrupted mid-copy. Safe to run at the start of every --live run: a
+    .partial file is only ever a half-written copy, never a finished photo,
+    so any one found here means an earlier run died before it could finalize.
+    """
+    found = list(dest_root.rglob(f"*{PARTIAL_SUFFIX}"))
+    for partial in found:
+        logger.warning(f"Removing orphaned partial file from an interrupted prior run: {partial}")
+        partial.unlink()
+    return len(found)
+
+
+def safe_move(src_path, final_path, expected_sha1):
+    """
+    Moves src_path to final_path without ever leaving a partial/corrupt file
+    visible under the final filename, even if interrupted mid-copy.
+
+    Sequence: copy to a same-directory temp file -> verify its hash matches
+    the source -> atomically rename temp -> final (os.replace is atomic on
+    the same filesystem) -> only THEN delete the source.
+
+    If interrupted:
+      - before the atomic rename: final_path never existed; a .partial file
+        may be left behind, cleaned up by clean_orphaned_partials() next run.
+      - after the atomic rename but before the source delete: final_path is
+        a complete, verified file; the source is simply reprocessed on the
+        next run and caught as a duplicate by the destination-side check in
+        organize_photos() below, even if the DB write never happened.
+    """
+    temp_path = final_path.with_name(final_path.name + PARTIAL_SUFFIX)
+    shutil.copy2(str(src_path), str(temp_path))
+
+    if compute_sha1(temp_path) != expected_sha1:
+        temp_path.unlink(missing_ok=True)
+        raise IOError(f"Copy verification failed for {src_path} -> {temp_path}; source left untouched.")
+
+    os.replace(str(temp_path), str(final_path))  # atomic within the same directory/filesystem
+    src_path.unlink()
+
+
+def resolve_target_path(target_dir, file_name, sha1):
+    """
+    Decides where a file should land, handling three cases:
+      - no collision: use the plain target path
+      - a file with the same name already exists at the destination AND has
+        the same content (sha1 match) -> this is a duplicate, most likely
+        left over from an interrupted prior run whose DB write never
+        happened. Returns None to signal "treat as duplicate, don't move."
+      - a file with the same name exists but different content -> genuinely
+        different photo that happens to share a filename; fall back to the
+        counter-suffix renaming in get_unique_path().
+    This filesystem-level check means duplicate detection still works
+    correctly across an interrupted run even if the SQLite record for the
+    earlier copy was never written.
+    """
+    candidate = target_dir / file_name
+    if not candidate.exists():
+        return candidate
+
+    if compute_sha1(candidate) == sha1:
+        return None
+
+    return get_unique_path(candidate)
+
+
 def organize_photos(source_dir, dest_dir, db_path, dry_run=True):
     src_root = Path(source_dir).expanduser().resolve()
     dest_root = Path(dest_dir).expanduser().resolve()
@@ -239,6 +318,9 @@ def organize_photos(source_dir, dest_dir, db_path, dry_run=True):
 
     if not dry_run:
         dest_root.mkdir(parents=True, exist_ok=True)
+        cleaned = clean_orphaned_partials(dest_root)
+        if cleaned:
+            logger.info(f"Cleaned up {cleaned} orphaned partial file(s) from an interrupted prior run.")
 
     conn = init_db(db_path)
 
@@ -271,6 +353,8 @@ def organize_photos(source_dir, dest_dir, db_path, dry_run=True):
             ext = file_path.suffix.lower()
             if ext not in SUPPORTED_EXTENSIONS:
                 continue
+            if file_path.name.endswith(PARTIAL_SUFFIX):
+                continue  # a leftover temp file, shouldn't normally appear under src_root
 
             try:
                 sha1 = compute_sha1(file_path)
@@ -301,14 +385,29 @@ def organize_photos(source_dir, dest_dir, db_path, dry_run=True):
                 phash = compute_phash(file_path, ext)
 
                 target_dir = dest_root / date_obj.strftime('%Y') / date_obj.strftime('%m') / date_obj.strftime('%d')
-                final_path = get_unique_path(target_dir / file_path.name)
 
                 if dry_run:
+                    # No filesystem writes have happened yet in this preview, so
+                    # just use the simple name-collision check.
+                    final_path = get_unique_path(target_dir / file_path.name)
                     logger.info(f"[DRY RUN] Would move: {file_path.name} -> {final_path}")
                     session_hashes[sha1] = str(final_path)
                 else:
+                    final_path = resolve_target_path(target_dir, file_path.name, sha1)
+                    if final_path is None:
+                        # Byte-identical file already sitting at the destination —
+                        # most likely from an interrupted prior run whose DB
+                        # write never completed. Treat exactly like a duplicate.
+                        count_duplicates += 1
+                        file_path.unlink()
+                        logger.info(
+                            f"Deleted exact duplicate: {file_path} "
+                            f"(matches existing file at {target_dir / file_path.name})"
+                        )
+                        continue
+
                     target_dir.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(file_path), str(final_path))
+                    safe_move(file_path, final_path, sha1)
                     logger.info(f"Moved: {file_path.name} -> {final_path}")
                     record_photo(conn, sha1, phash, file_path, final_path, date_obj)
                     count_moved += 1
