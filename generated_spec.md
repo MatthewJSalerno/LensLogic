@@ -3,12 +3,18 @@
 ## 1. Project Overview
 **Objective:** A web-based application designed to automate the organization of large, complex photo collections.
 **Core Problem:** Users struggle with redundant files, non-standardized directory structures, and inconsistent metadata across multiple devices/exports.
-**Primary Goals:**
-*   **Standardization:** Automate moving files into a coherent structure (e.g., `/Year/Month/Date_Event/`).
-*   **Deduplication:** Remove identical files using SHA1 hashing.
-*   **Fuzzy Mapping:** Identify and group visually similar images using perceptual hashing (pHash).
-*   **Metadata Integrity:** Preserve and synchronize EXIF data across related images.
-*   **Data Safety:** Ensure all file operations are transactional, recoverable, and non-destructive.
+
+**Development Roadmap:**
+*   **Phase 1 (Core Engine - MVP):** Focus on the backend "heavy lifting."
+    *   Automated move to structured directories (EXIF-based).
+    *   Generation and storage of SHA1 and pHash.
+    *   Exact deduplication.
+    *   Robust "Safety" protocols (Dry Run, Copy-Verify-Delete).
+    *   Support for standard and RAW/DNG formats.
+*   **Phase 2 (Discovery & Analysis):** Focus on the "User Experience" of discovery.
+    *   Fuzzy-matching visual reports.
+    *   Similarity clustering and "Merger" tools.
+    *   Advanced search and metadata resolution UI.
 
 ## 2. Target Audience
 *   **Primary:** Professional photographers and content creators managing thousands of assets.
@@ -19,7 +25,7 @@ To balance heavy-duty data processing with a high-quality user experience, the a
 
 ### 3.1. The Frontend (User Experience)
 *   **Technology:** Modern Web Framework (e.g., React, Vue, or Svelte).
-*   **Function:** Provides a dashboard for file path configuration, "Dry Run" report viewing, "Merge" resolution, and real-time progress tracking via WebSockets.
+*   **Function:** Provides a dashboard for file path configuration, "Dry Run" report viewing, and real-time progress tracking via WebSockets.
 
 ### 3.2. The Web & API Layer (Node.js)
 *   **Role:** Acts as the "Command Center" and communication bridge.
@@ -33,22 +39,22 @@ To balance heavy-duty data processing with a high-quality user experience, the a
 
 ## 4. Functional Requirements
 ### 4.1. Input & Configuration
-*   **Path Definitions:** Users must provide a **Source Path** (messy collection) and a **Destination Path** (organized output).
+*   **Path Definitions:** Users provide a **Source Path** (messy collection) and a **Destination Path** (organized output).
 *   **Dry Run Mode (Default):** The system defaults to a "Dry Run." It performs the full scan, identifies duplicates, calculates hashes, and flags collisions, but does **not** move or delete any files.
 *   **Merge/Action Mode:** Users must explicitly "Commit" changes after reviewing the Dry Run results to initiate the physical data migration.
 
 ### 4.2. Processing Logic
-*   **Deduplication:**
+*   **Deduplication (Phase 1):**
     *   **Exact Match:** Files with identical SHA1 hashes are flagged as clones.
-    *   **Fuzzy Match:** Files with similar pHashes are grouped together as "potentially similar."
+    *   **Fuzzy Match (Collection):** All images will have a pHash generated and stored during the initial scan to support future fuzzy-matching features.
 *   **Metadata Collisions:** 
-    *   When pHashes are similar but SHA1s differ, the system identifies these as "Metadata Collisions" (e.g., the same photo with different EXIF data or different compression).
-    *   The system flags these for the user to "Merge" metadata from a primary source to the secondary.
+    *   When pHashes are similar but SHA1s differ, the system identifies these as "Metadata Collisions."
+    *   Phase 2 will include a specialized UI for resolving these collisions.
 *   **Unique Filename Enforcement:**
     *   To prevent accidental overwriting, the system checks if a file name already exists in the destination.
-    *   If a collision occurs (e.g., two different photos named `IMG_001.jpg`), the system automatically appends a unique suffix (e.g., `IMG_001_1.jpg`).
+    *   If a collision occurs, the system automatically appends a unique suffix (e.g., `IMG_001_1.jpg`).
 *   **Broad Format Support:**
-    *   Full support for standard formats (JPEG, PNG, TIFF) and professional formats (**RAW, DNG, CR2, NEF**).
+    *   Support for standard formats (JPEG, PNG, TIFF) and professional formats (**RAW, DNG, CR2, NEF**).
 *   **Standardized Movement:** Files are moved based on EXIF "Date Taken" timestamps.
 
 ### 4.3. Safety & Durability
@@ -94,6 +100,6 @@ To balance heavy-duty data processing with a high-quality user experience, the a
 ## 7. Non-Functional Requirements
 *   **Data Integrity:** No file is deleted from the source until it is verified at the destination.
 *   **Durability:** System must be able to resume a "Commit" operation after a restart or crash.
-*   **Performance:** Python worker should utilize multi-threading/processing for hash calculations.
+*   **Performance:** The Python engine should utilize multi-threading/processing to calculate hashes concurrently.
 *   **Safety:** Dry Run must be the default; no destructive actions occur without explicit user "Commit."
 *   **Scalability:** System must handle 10,000+ images while maintaining a responsive UI.
