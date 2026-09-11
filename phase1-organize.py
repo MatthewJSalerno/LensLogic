@@ -16,8 +16,6 @@ System & Python Dependencies:
       Linux: sudo apt install exiftool
       macOS: brew install exiftool
       Windows: choco install exiftool
-- Python Packages:
-    pip install Pillow imagehash pillow-heif
 """
 
 import argparse
