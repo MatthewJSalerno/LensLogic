@@ -141,6 +141,12 @@ SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.tiff', '.raw', '.dng
 PARTIAL_SUFFIX = ".organizing.partial"
 LOCK_FILENAME = "engine.lock"
 
+# Statuses whose source file is legitimately gone because a prior --move run
+# consumed it on purpose. Targeted re-runs skip these rather than re-scanning
+# them: the source is *supposed* to be missing, so re-indexing would overwrite
+# a real 'Completed' audit state with a spurious 'Failed'.
+SOURCE_CONSUMED_STATUSES = ('Completed', 'Removed_Duplicate')
+
 # --- Dependency Check ---
 try:
     import imagehash
@@ -203,6 +209,7 @@ class ProcessingResult:
     has_name_collision: bool = False
     collision_group: Optional[int] = None
     is_master: bool = False
+    error_message: Optional[str] = None
 
 
 # --- Producer-Consumer Queue ---
@@ -473,7 +480,10 @@ def db_writer_worker(db_path: str):
             cursor.execute("SELECT id FROM photos WHERE source_path = ?", (result.file_path,))
             photo_row = cursor.fetchone()
             photo_id = photo_row[0] if photo_row else None
-            log_operation(conn, result.run_id, photo_id, result.file_path, result.dest_path, status)
+            log_operation(
+                conn, result.run_id, photo_id, result.file_path, result.dest_path, status,
+                result.error_message, result.has_name_collision
+            )
         except Exception as e:
             logger.error(f"DB writer failed to record {result.file_path}: {e}")
         finally:
@@ -801,6 +811,49 @@ def get_unique_dest_path(target_path: Path) -> Path:
 
 
 # --- Copy-Verify-Delete Core Protocol ---
+class DestinationExistsError(Exception):
+    """
+    Raised when the final destination name is already occupied at the moment
+    the verified partial file is about to be published under it.
+
+    Deliberately NOT an OSError subclass: retry_io_operation() catches
+    OSError to ride out transient network-share hiccups, and retrying a
+    name collision would just burn the backoff delays before failing
+    anyway. This is a permanent condition for this filename, not a blip.
+    """
+
+
+def _finalize_partial(partial_dest: Path, dest: Path):
+    """
+    Publishes the verified partial file under its final name WITHOUT ever
+    overwriting an existing file.
+
+    Path.rename() cannot be used directly here: on POSIX it silently
+    replaces an existing destination, so a same-named file already sitting
+    at `dest` would be destroyed with no error raised and no record kept.
+    os.link() is the atomic alternative — it fails with FileExistsError
+    rather than clobbering — and since the partial always lives in the same
+    directory as its final name, it is always on the same filesystem.
+
+    Filesystems that cannot hard-link (FAT/exFAT on external drives, some
+    network shares) fall back to an explicit existence check plus rename.
+    That leaves a narrow TOCTOU window, but only against a process outside
+    this engine — the single-instance lock plus this loop being serial rules
+    out racing ourselves.
+    """
+    try:
+        os.link(str(partial_dest), str(dest))
+    except FileExistsError:
+        raise DestinationExistsError(f"Destination already exists, refusing to overwrite: {dest}")
+    except OSError:
+        if dest.exists():
+            raise DestinationExistsError(f"Destination already exists, refusing to overwrite: {dest}")
+        partial_dest.rename(dest)
+        return
+    partial_dest.unlink()
+
+
+
 def copy_verify_delete(source_str: str, dest_str: str, delete_source: bool = True) -> tuple:
     """
     Copies source to dest via a verified temp-file-then-rename sequence.
@@ -833,7 +886,7 @@ def copy_verify_delete(source_str: str, dest_str: str, delete_source: bool = Tru
                 partial_dest.unlink()
             return False, error_message
 
-        retry_io_operation(f"Rename partial {partial_dest.name}", partial_dest.rename, dest)
+        _finalize_partial(partial_dest, dest)
 
         if delete_source:
             retry_io_operation(f"Delete original {source.name}", source.unlink)
@@ -853,36 +906,73 @@ def copy_verify_delete(source_str: str, dest_str: str, delete_source: bool = Tru
 
 
 # --- Processing Worker ---
-def process_file_task(file_path_str: str, dest_base_path: str, run_id: int) -> ProcessingResult:
-    file_path = Path(file_path_str)
-    sha1 = compute_sha1(str(file_path))
-    phash = compute_phash(str(file_path))
-
-    dt, metadata = get_metadata_and_date(file_path)
-    # Keep an explicit, guaranteed-present date_taken key regardless of which
-    # capture path produced `metadata`, since downstream consumers (path
-    # computation here, and the inspector UI later) shouldn't need to know
-    # ExifTool's exact tag-naming conventions just to find "the date."
-    metadata["date_taken"] = dt.isoformat()
-
-    year_dir = dt.strftime("%Y")
-    month_dir = dt.strftime("%m")
-    day_dir = dt.strftime("%d")
-    target_folder = Path(dest_base_path) / year_dir / month_dir / day_dir
-    initial_dest = target_folder / file_path.name
-    final_dest = get_unique_dest_path(initial_dest)
-    has_collision = (final_dest != initial_dest)
-
+def _failed_result(file_path_str: str, run_id: int, error_message: str) -> ProcessingResult:
+    """Builds the Failed result for a file that could not be scanned at all."""
     return ProcessingResult(
-        file_path=str(file_path),
-        sha1_hash=sha1,
-        phash=phash,
-        metadata=metadata,
-        status="Pending",
-        dest_path=str(final_dest),
-        run_id=run_id,
-        has_name_collision=has_collision
+        file_path=file_path_str, sha1_hash="", phash="", metadata={}, status="Failed",
+        dest_path="", run_id=run_id, error_message=error_message
     )
+
+
+def process_file_task(file_path_str: str, dest_base_path: str, run_id: int) -> ProcessingResult:
+    """
+    Scans one file: SHA-1, pHash, metadata/date, and its projected destination.
+
+    NEVER raises. Any per-file failure comes back as a Failed result carrying
+    a human-readable reason. Previously this function had no error handling at
+    all, so a single unreadable or vanished file propagated its exception out
+    through future.result() in main() and aborted the ENTIRE run — discarding
+    every other file's completed work and leaving no record of which file was
+    responsible.
+    """
+    file_path = Path(file_path_str)
+
+    # Checked explicitly, before any attempt to open the file, so a stale
+    # selection surfaces as a specific reason in the Error Center rather than
+    # a raw FileNotFoundError traceback (project-spec.md §4.4).
+    if not file_path.exists():
+        return _failed_result(
+            file_path_str, run_id,
+            f"Source file changed: no longer found at {file_path}. It may have been moved, "
+            f"renamed, or deleted outside NegativeSpace since the last Index."
+        )
+
+    try:
+        sha1 = compute_sha1(str(file_path))
+        phash = compute_phash(str(file_path))
+
+        dt, metadata = get_metadata_and_date(file_path)
+        # Keep an explicit, guaranteed-present date_taken key regardless of which
+        # capture path produced `metadata`, since downstream consumers (path
+        # computation here, and the inspector UI later) shouldn't need to know
+        # ExifTool's exact tag-naming conventions just to find "the date."
+        metadata["date_taken"] = dt.isoformat()
+
+        year_dir = dt.strftime("%Y")
+        month_dir = dt.strftime("%m")
+        day_dir = dt.strftime("%d")
+        target_folder = Path(dest_base_path) / year_dir / month_dir / day_dir
+
+        # This destination is a PROJECTION, not a reservation, and
+        # has_name_collision stays False here by design. The authoritative
+        # unique-name resolution happens immediately before the file is
+        # actually written (see _run_move_or_copy). Resolving it here instead
+        # was silent data loss: at Index time the destination tree is normally
+        # still empty, so two different photos sharing a filename were both
+        # told the name was free, and whichever got written second overwrote
+        # the first — with both runs reporting success.
+        return ProcessingResult(
+            file_path=str(file_path),
+            sha1_hash=sha1,
+            phash=phash,
+            metadata=metadata,
+            status="Pending",
+            dest_path=str(target_folder / file_path.name),
+            run_id=run_id,
+            has_name_collision=False
+        )
+    except Exception as e:
+        return _failed_result(file_path_str, run_id, f"{type(e).__name__}: {e}")
 
 
 # --- Single-Instance Enforcement ---
@@ -961,17 +1051,23 @@ def _query_source_subdir(db_path: str, subdir_filter_path: Path) -> List[str]:
     """
     Looks up already-cataloged `photos.source_path` values falling under
     `subdir_filter_path` (the exact directory itself, or recursively below
-    it), without touching status. Used for Index-mode re-scans scoped to a
-    subdirectory; the Move/Copy targeting path additionally filters on
-    `status = 'Pending'` inline rather than calling this helper.
+    it). Rows whose source a prior --move already consumed on purpose are
+    excluded (SOURCE_CONSUMED_STATUSES); everything else is returned even if
+    the file is missing from disk, so process_file_task can record it as
+    Failed with a real reason instead of it silently vanishing from the run.
+    Used for Index-mode re-scans scoped to a subdirectory; the Move/Copy
+    targeting path additionally filters on `status = 'Pending'` inline
+    rather than calling this helper.
     """
     conn = get_db_connection(db_path)
+    placeholders = ','.join('?' * len(SOURCE_CONSUMED_STATUSES))
     rows = conn.execute(
-        "SELECT id, source_path FROM photos WHERE source_path = ? OR source_path LIKE ?",
-        (str(subdir_filter_path), f"{subdir_filter_path}{os.sep}%")
+        f"SELECT source_path FROM photos WHERE (source_path = ? OR source_path LIKE ?) "
+        f"AND status NOT IN ({placeholders})",
+        (str(subdir_filter_path), f"{subdir_filter_path}{os.sep}%", *SOURCE_CONSUMED_STATUSES)
     ).fetchall()
     conn.close()
-    return [r[1] for r in rows if Path(r[1]).exists()]
+    return [r[0] for r in rows]
 
 
 def main():
@@ -1124,14 +1220,25 @@ def main():
             conn = get_db_connection(str(db_path))
             placeholders = ','.join('?' * len(args.file_ids))
             rows = conn.execute(
-                f"SELECT id, source_path FROM photos WHERE id IN ({placeholders})", args.file_ids
+                f"SELECT id, source_path, status FROM photos WHERE id IN ({placeholders})", args.file_ids
             ).fetchall()
             conn.close()
             found_ids = {r[0] for r in rows}
             missing = set(args.file_ids) - found_ids
             if missing:
                 logger.warning(f"file-ids not found in database (never indexed?): {sorted(missing)}")
-            files_to_process = [r[1] for r in rows if Path(r[1]).exists()]
+            already_done = [r for r in rows if r[2] in SOURCE_CONSUMED_STATUSES]
+            if already_done:
+                logger.info(
+                    f"Skipping {len(already_done)} targeted file(s) already completed by a prior run — "
+                    f"their source was removed on purpose."
+                )
+            # Files missing for any OTHER reason are deliberately NOT filtered
+            # out: they flow through to process_file_task, which records each
+            # one as Failed with a specific reason. Dropping them here (the
+            # previous behavior) made a stale selection silently shrink, with
+            # nothing in the audit log explaining where those files went.
+            files_to_process = [r[1] for r in rows if r[2] not in SOURCE_CONSUMED_STATUSES]
             logger.info(f"Targeting {len(files_to_process)} of {len(args.file_ids)} requested file IDs.")
         elif subdir_filter_path is not None:
             # Same idea as --file-ids: query already-cataloged rows instead of
@@ -1233,16 +1340,34 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
                 log_operation(conn, run_id, cancelled_id, cancelled_src, cancelled_dst, "Cancelled")
             break
 
-        cursor.execute("SELECT has_name_collision FROM photos WHERE id = ?", (record_id,))
-        collision_row = cursor.fetchone()
-        has_collision = bool(collision_row[0]) if collision_row else False
+        # Resolve the final unique filename HERE, immediately before the file
+        # is written — not back at Index time. project-spec.md §4.3 requires
+        # the check to happen "before writing to a computed destination path",
+        # and the distinction is not academic: at Index time the destination
+        # tree is normally empty, so every same-named file is told its name is
+        # free. Two different photos named IMG_0001.jpg (two camera cards, say)
+        # would both be assigned the identical destination, and the second one
+        # moved would silently destroy the first — source already deleted, both
+        # operations reporting success. By this point in the run, anything
+        # already moved is really on disk, so exists() gives a truthful answer.
+        resolved_dst = str(get_unique_dest_path(Path(dst)))
+        has_collision = (resolved_dst != dst)
+        if has_collision:
+            logger.info(
+                f"Destination name already taken — writing {Path(dst).name} as "
+                f"{Path(resolved_dst).name} instead."
+            )
+            cursor.execute(
+                "UPDATE photos SET dest_path = ?, has_name_collision = 1 WHERE id = ?",
+                (resolved_dst, record_id)
+            )
 
         cursor.execute("UPDATE photos SET status = 'Processing' WHERE id = ?", (record_id,))
         conn.commit()
 
         # --move deletes the verified source (delete_source=True, the
         # default); --copy leaves it untouched (delete_source=False).
-        success, error_message = copy_verify_delete(src, dst, delete_source=args.move)
+        success, error_message = copy_verify_delete(src, resolved_dst, delete_source=args.move)
 
         if args.move:
             final_status = "Completed" if success else "Failed"
@@ -1250,7 +1375,7 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
             final_status = "Copied" if success else "Failed"
         cursor.execute("UPDATE photos SET status = ? WHERE id = ?", (final_status, record_id))
         conn.commit()
-        log_operation(conn, run_id, record_id, src, dst, final_status, error_message, has_collision)
+        log_operation(conn, run_id, record_id, src, resolved_dst, final_status, error_message, has_collision)
 
     if args.move and not was_cancelled:
         # Duplicate source-file removal is a --move-only step. It's
