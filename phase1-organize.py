@@ -10,15 +10,15 @@ Runtime Arguments:
 
 Mode flags (mutually exclusive — pick at most one; omitting both runs the
 default Dry Run):
-- --live: Execute physical migration (Copy-Verify-Delete). Source files are
+- --move: Execute physical migration (Copy-Verify-Delete). Source files are
   moved: deleted after a verified copy lands at the destination. Confirmed
   exact duplicates are also removed from source once a verified copy of
   their content exists elsewhere at the destination.
-- --copy: Non-destructive. Same verified Copy-Verify step as --live, but the
+- --copy: Non-destructive. Same verified Copy-Verify step as --move, but the
   source file is never deleted or modified afterward. Duplicate source files
   are also left untouched in this mode — nothing is ever removed from source.
 - (neither of the above): Dry Run — full scan, hashing, and destination-path
-  resolution, exactly like --live/--copy would compute, but no physical
+  resolution, exactly like --move/--copy would compute, but no physical
   action is taken. This is the safe default described in spec §4.1.
 
 System & Python Dependencies:
@@ -246,7 +246,7 @@ def db_writer_worker(db_path: str):
             # FIX: UPSERT on source_path instead of a blind INSERT. This is
             # the direct fix for the crash — re-scanning a file already
             # cataloged from a prior run (e.g. re-running a dry run, or the
-            # standard dry-run-then---live sequence) previously violated the
+            # standard dry-run-then-move sequence) previously violated the
             # UNIQUE constraint on source_path and killed this thread. Now a
             # re-scan just refreshes that row's hashes/status in place.
             cursor.execute(
@@ -442,7 +442,7 @@ def get_unique_dest_path(target_path: Path) -> Path:
 def copy_verify_delete(source_str: str, dest_str: str, delete_source: bool = True) -> bool:
     """
     Copies source to dest via a verified temp-file-then-rename sequence.
-    delete_source=True (the --live/move behavior): source is deleted only
+    delete_source=True (the --move behavior): source is deleted only
     after the copy is verified byte-for-byte identical — this is the
     Copy-Verify-Delete protocol from spec §4.3.
     delete_source=False (the --copy behavior): the copy is still verified
@@ -522,7 +522,7 @@ def main():
     # action. The three flags below are mutually exclusive with each other.
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
-        "--live", action="store_true",
+        "--move", action="store_true",
         help="Execute physical migration (Copy-Verify-Delete, source files are moved/deleted)."
     )
     mode_group.add_argument(
@@ -549,7 +549,7 @@ def main():
         logger.error(f"Source path does not exist: {source_path}")
         return
 
-    mode_label = "COPY" if args.copy else ("LIVE" if args.live else "DRY RUN")
+    mode_label = "COPY" if args.copy else ("MOVE" if args.move else "DRY RUN")
     logger.info(f"Initializing LensLogic Engine. Mode: {mode_label}")
     logger.info(f"Base Directory: {base_dir}")
     logger.info(f"Source Directory: {source_path}")
@@ -581,9 +581,9 @@ def main():
 
     logger.info("Scan and indexing completed successfully. Database updated.")
 
-    if args.live or args.copy:
-        action_verb = "Moving" if args.live else "Copying"
-        logger.info(f"{'Live' if args.live else 'Copy'} Mode enabled. Initiating Pre-flight Space Checks...")
+    if args.move or args.copy:
+        action_verb = "Moving" if args.move else "Copying"
+        logger.info(f"{'Move' if args.move else 'Copy'} Mode enabled. Initiating Pre-flight Space Checks...")
         conn = get_db_connection(str(db_path))
         cursor = conn.cursor()
         cursor.execute("SELECT id, source_path, dest_path FROM photos WHERE status = 'Pending'")
@@ -607,20 +607,20 @@ def main():
             cursor.execute("UPDATE photos SET status = 'Processing' WHERE id = ?", (record_id,))
             conn.commit()
 
-            # --live deletes the verified source (delete_source=True, the
+            # --move deletes the verified source (delete_source=True, the
             # default); --copy leaves it untouched (delete_source=False).
-            success = copy_verify_delete(src, dst, delete_source=args.live)
+            success = copy_verify_delete(src, dst, delete_source=args.move)
 
-            if args.live:
+            if args.move:
                 final_status = "Completed" if success else "Failed"
             else:
                 final_status = "Copied" if success else "Failed"
             cursor.execute("UPDATE photos SET status = ? WHERE id = ?", (final_status, record_id))
             conn.commit()
 
-        if args.live:
-            # Duplicate source-file removal is a --live-only step. It's
-            # deliberately gated on status='Completed', which only a --live
+        if args.move:
+            # Duplicate source-file removal is a --move-only step. It's
+            # deliberately gated on status='Completed', which only a --move
             # run ever produces (--copy runs produce 'Copied' instead) — so
             # this block naturally never touches anything from a --copy run,
             # keeping --copy fully non-destructive as intended, with no
@@ -657,9 +657,9 @@ def main():
                 logger.info(f"Duplicate cleanup: removed {removed_count} of {len(duplicate_records)} flagged duplicates.")
 
         conn.close()
-        logger.info(f"All {'live migration' if args.live else 'copy'} operations finished.")
+        logger.info(f"All {'move' if args.move else 'copy'} operations finished.")
     else:
-        logger.info("Dry Run finished. Pass `--live` to move files, or `--copy` to copy them non-destructively.")
+        logger.info("Dry Run finished. Pass `--move` to move files, or `--copy` to copy them non-destructively.")
 
 
 if __name__ == "__main__":
