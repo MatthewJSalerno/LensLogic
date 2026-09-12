@@ -4,6 +4,10 @@
 
 The NegativeSpace Web Interface provides a modern web UI for the containerized Python Phase 1 engine (`ns-engine.py`). It transforms the CLI engine into an interactive application supporting real-time operation monitoring, selective file processing, context-aware duplicate resolution, detailed metadata inspection, dedicated runtime settings management, extension validation, and audit logging.
 
+**The web UI is the interface.** As of Phase 2 the engine's command-line flags are an *internal* calling convention between FastAPI and the engine — not a supported end-user surface. Users interact with NegativeSpace through the web UI; nothing in the user-facing documentation should direct them to invoke `ns-engine.py` by hand.
+
+The flags are deliberately **not** hidden (no `argparse.SUPPRESS`), and the engine reference documentation stays in the repository. Anyone cloning the project to understand, debug, or extend it benefits from being able to run the engine directly, and hiding the flags would buy nothing — anyone who can execute the engine can read its source. The distinction is *documented for users* versus *available to developers*, not *present* versus *absent*.
+
 ```
 +-----------------------------------------------------------------------------------+
 |                                  React Frontend                                   |
@@ -32,7 +36,7 @@ The NegativeSpace Web Interface provides a modern web UI for the containerized P
 ```
 1. User triggers an Index scan (full directory or, on a repeat visit,
    just a "Rescan" to pick up newly added files).
-   -> FastAPI checks for an already-active job (409 if one exists, §5.5)
+   -> FastAPI checks for an already-active job (409 if one exists, §5.6)
    -> FastAPI spawns: python3 ns-engine.py
    -> Engine scans the full source directory, hashes everything, flags
       duplicates, captures metadata, and populates SQLite.
@@ -77,7 +81,7 @@ Users can select individual files or multiple files across grid views to run tar
 * **Selection size limit:** Individual multi-select (including "Select all on page") is capped at a configurable maximum (default: 1,000 files) per job submission — this isn't an arbitrary UX restriction, it's because each selected file becomes an integer in the `--file-ids` command-line argument passed to the engine, and there's a real OS limit on total command-line length. Exceeding the cap shows a clear message (e.g. *"1,000 file limit for individual selection — try Folder Selection below for larger batches"*) rather than silently truncating the selection or attempting a job that might fail at spawn time.
 * **Folder Selection (for large batches):** Instead of "select all matching current filter" against individual files, users can select a source folder (recursive) and scope the operation to everything currently indexed under it. This maps directly to the engine's `--source-subdir <path>` flag (`project-spec.md` §4.1) rather than enumerating individual IDs, which sidesteps the command-line length limit entirely — there's no practical upper bound on how many files a folder selection can cover. Symlinks are excluded automatically, inherited from the original Index that populated the catalog (a symlink was never indexed as a row in the first place). If a folder hasn't been indexed yet (zero matching rows), show *"No indexed files found under this folder — run an Index first."*
 * **Sticky Action Bar:** Appears when items (individual or folder) are selected, presenting **Move Selected** and **Copy Selected** actions.
-* **Targeted Execution:** Individual selections use the `--file-ids <id1,id2>` flag; folder selections use `--source-subdir <path>`. These are mutually exclusive targeting mechanisms in a single job — pick one per submission. IDs (not raw file paths) were chosen for the individual case specifically because a database primary key is unambiguous and doesn't depend on path strings staying identical between when the frontend fetched the catalog and when the operation actually runs — and it gives the CLI the exact same targeting capability the web UI uses, with no web-only code path.
+* **Targeted Execution:** Individual selections use the `--file-ids <id1,id2>` flag; folder selections use `--source-subdir <path>`. These are mutually exclusive targeting mechanisms in a single job — pick one per submission. IDs (not raw file paths) were chosen for the individual case specifically because a database primary key is unambiguous and doesn't depend on path strings staying identical between when the frontend fetched the catalog and when the operation actually runs — and it keeps one targeting implementation rather than a parallel web-only code path, which is what makes the engine directly runnable for debugging and development (see §1).
 
 ---
 
@@ -239,7 +243,19 @@ A searchable table logging every operation performed by the engine:
 * **Columns:** Timestamp, Mode (`MOVE`/`COPY`), Source Path, Destination Path, Status (`Completed`, `Copied`, `Removed_Duplicate`, `Failed`), and System Error Message.
 * **Controls:** Filter by date, status, or free-text search; CSV/JSON export.
 
-### 5.5 Single Active Job Enforcement
+### 5.5 Engine Invocation as a Trust Boundary
+
+Because the engine's flags are now assembled by FastAPI from HTTP request bodies rather than typed by someone with shell access, argument construction is a **security boundary**, not a convenience. Three rules follow:
+
+* **Build the command as an argument list, never a shell string.** Use `subprocess.Popen([...])` / `subprocess.run([...])` without `shell=True`. Interpolating a user-supplied `source_subdir` into a shell command would be command injection reachable directly from an HTTP request — this is the single most damaging mistake available in this layer.
+* **`--source-subdir` carries user-chosen input** from the folder picker and is the most exposed parameter. The engine already resolves it and rejects anything escaping `--source` via `..` — that check is load-bearing under Phase 2 and must not be removed as a redundant-looking sanity check. FastAPI should validate independently rather than relying solely on the engine; defense in depth is the point, and the API can return a clean `400` instead of a failed job.
+* **`--exts` is the subject of the validation feature in §3.1.** The engine normalizes the leading dot and casing but does not otherwise constrain the value, so the API owns deciding which extensions are acceptable. Scope is limited to the mounted source directory, so the risk is indexing unintended file types rather than reading outside the volume — but a user-facing field still needs a server-side allowlist, not just client-side checks.
+
+Note also the `--file-ids` length ceiling described in §2: the 1,000-item selection cap is a real OS command-line limit, and enforcing it is the API's responsibility. Folder selections use `--source-subdir` precisely to sidestep it.
+
+---
+
+### 5.6 Single Active Job Enforcement
 
 Only one engine process may run at a time — see `project-spec.md` §4.1/§7 for the engine-level guarantee (an OS-level `flock`, held for the whole process lifetime, released automatically even on a hard `SIGKILL`). This is enforced in two layers, not one:
 
@@ -394,7 +410,7 @@ Updates global engine settings.
 
 POST /api/v1/jobs/start
 
-Starts an engine execution job, automatically injecting active configuration parameters from /settings if not explicitly overridden. `file_ids` and `source_subdir` are mutually exclusive — provide one or neither (a full directory scan), never both. Returns `409 Conflict` if another job is already running (§5.5) instead of spawning a doomed subprocess.
+Starts an engine execution job, automatically injecting active configuration parameters from /settings if not explicitly overridden. `file_ids` and `source_subdir` are mutually exclusive — provide one or neither (a full directory scan), never both. Returns `409 Conflict` if another job is already running (§5.6) instead of spawning a doomed subprocess.
 
     Body (individual selection):
     JSON
