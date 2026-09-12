@@ -164,7 +164,7 @@ except ImportError:
 # — PIL cannot decode real RAW sensor data (.raw/.dng/.cr2/.nef/.arw/.raf)
 # at all, so every one of those files silently got the literal string
 # "error" stored as its phash, never a usable hash. This matches what
-# generated_spec.md §3.3 already calls for ("rawpy for robust RAW and DNG
+# project-spec.md §3.3 already calls for ("rawpy for robust RAW and DNG
 # metadata handling") but which wasn't actually wired in.
 try:
     import rawpy
