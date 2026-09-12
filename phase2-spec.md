@@ -4,6 +4,7 @@
 
 The LensLogic Web Interface provides a modern web UI for the containerized Python Phase 1 engine (`phase1-organize.py`). It transforms the CLI engine into an interactive application supporting real-time operation monitoring, selective file processing, context-aware duplicate resolution, detailed metadata inspection, dedicated runtime settings management, extension validation, and audit logging.
 
+```
 +-----------------------------------------------------------------------------------+
 |                                  React Frontend                                   |
 |  [ Dashboard ]  [ Gallery / Grid ]  [ Split Inspector ]  [ Settings / Config ]    |
@@ -18,6 +19,7 @@ The LensLogic Web Interface provides a modern web UI for the containerized Pytho
 |                             Phase 1 Engine Core                                   |
 |   (phase1-organize.py --workers N --exts ex1,ex2 --file-ids id1,id2)              |
 +-----------------------------------------------------------------------------------+
+```
 
 
 ---
@@ -75,6 +77,7 @@ Users can select individual files or multiple files across grid views to run tar
 
 A dedicated Settings view provides central management of engine parameters, persisted to SQLite and passed to engine instances on startup.
 
+```
 +---------------------------------------------------------------------------------+
 | SETTINGS & SYSTEM CONFIGURATION                                                 |
 +---------------------------------------------------------------------------------+
@@ -100,6 +103,7 @@ A dedicated Settings view provides central management of engine parameters, pers
 +---------------------------------------------------------------------------------+
 |                                                   [ RESET ]  [ SAVE SETTINGS ]  |
 +---------------------------------------------------------------------------------+
+```
 
 
 ### 3.1 Extension EXIF Support Validation Subsystem
@@ -117,6 +121,7 @@ When a user attempts to add or select a custom extension in the settings panel o
 ### 4.1 Real-Time Operations Drawer
 When a job is active, a progress drawer expands at the bottom of the viewport.
 
+```
 +-----------------------------------------------------------------------------------+
 | [X] Moving 3 Files...  | Progress: [========............] 66% (1 Remaining)       |
 +-----------------------------------------------------------------------------------+
@@ -125,6 +130,7 @@ When a job is active, a progress drawer expands at the bottom of the viewport.
 | - [DONE] IMG_001.JPG -> /data/dest/2026/02/14/IMG_001.JPG (SHA1 Verified)         |
 | - [IN PROGRESS] IMG_002.CR2 -> /data/dest/2026/02/14/IMG_002.CR2                   |
 +-----------------------------------------------------------------------------------+
+```
 
 * **Metrics:** Active step, progress percentage, active worker count, current DB queue backpressure level, files completed vs. remaining.
 * **Live Log Stream:** Direct source-to-destination mapping display with verification status.
@@ -133,6 +139,7 @@ When a job is active, a progress drawer expands at the bottom of the viewport.
 ### 4.2 Split-Screen Photo Inspector Panel
 Clicking an image opens a right-side 50% detail panel.
 
+```
 +---------------------------------------------------------------------------------+
 | PHOTO DETAIL INSPECTOR                                                      [X] |
 +---------------------------------------------------------------------------------+
@@ -155,6 +162,7 @@ Clicking an image opens a right-side 50% detail panel.
 | * [SOURCE] /data/source/sd_card/IMG_0001-1234.JPG (Completed)                   |
 | * [DEST]   /data/dest/2026/02/14/IMG_0001_1.JPG (Completed)                      |
 +---------------------------------------------------------------------------------+
+```
 
 
 #### Inspector Data Display Matrix
@@ -191,6 +199,7 @@ Jobs run asynchronously in FastAPI. If a user closes or refreshes their browser,
 ### 5.3 Error Center
 If operations fail, an Error Banner highlights the failures, sourced directly from the `operations` log's `error_message` column (see §6.1) — the real exception text is persisted, not just a generic "failed" flag.
 
+```
 +-----------------------------------------------------------------------------------+
 | FAILED OPERATIONS (2 Items)                                                       |
 +-----------------------------------------------------------------------------------+
@@ -202,6 +211,7 @@ If operations fail, an Error Banner highlights the failures, sourced directly fr
 |    Source: /data/source/corrupted/IMG_0912.JPG                                   |
 |    Error:  ChecksumMismatch: SHA-1 verification failed                            |
 +-----------------------------------------------------------------------------------+
+```
 
 Users can view exact system error strings (e.g., `PermissionError`, `ChecksumMismatch`).
 
