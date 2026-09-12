@@ -17,7 +17,18 @@ Runtime Arguments:
   already-cataloged files. A file must have gone through at least one prior
   Index for its ID to exist. This is what powers selection-scoped
   operations from the web UI (Phase 2) — e.g. "Move just these 3 photos" —
-  but works identically from the CLI.
+  but works identically from the CLI. Mutually exclusive with
+  --source-subdir.
+- --source-subdir <path> (Optional) Path, relative to --source, scoping the
+  run to already-cataloged files beneath it. Queries the catalog by
+  source_path prefix instead of walking the filesystem or enumerating IDs,
+  which is what lets the web UI offer "operate on this whole folder" for
+  selections far larger than --file-ids can express (there is a real OS
+  limit on command-line length). Mutually exclusive with --file-ids.
+
+Per-file failures never abort a run: an unreadable, vanished, or otherwise
+unprocessable file is recorded as status='Failed' with a human-readable
+reason in operations.error_message, and the scan carries on with the rest.
 
 Mode flags (mutually exclusive — pick at most one; omitting both runs the
 default Index):
@@ -34,7 +45,10 @@ default Index):
 
 Cancellation: sending SIGTERM or SIGINT (e.g. `docker stop`, or Ctrl+C)
 during a --move/--copy run lets the file currently being copy-verified
-finish, then stops before starting the next one. Every file that didn't get
+finish, then stops before starting the next one. During the Index/scan
+phase it takes effect at the next batch boundary, and a scan cancelled that
+way skips the move/copy phase entirely rather than entering it; everything
+already written to the database is kept, so re-running simply continues. Every file that didn't get
 a chance to run is written to the operations log with status='Cancelled' —
 current, un-started work stays 'Pending' in the photos table (so a plain
 re-run naturally picks it back up), while the operations log keeps a full
