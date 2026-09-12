@@ -7,16 +7,21 @@ Runtime Arguments:
 - --dest <path> (Optional) Path for organized output directory (default: "/data/dest").
 - --base <path> (Optional) Base directory for app artifacts (default: "/data").
   Creates/uses <base>/db/ for SQLite and <base>/logs/ for logs.
-- --live (Optional) Flag to execute physical Copy-Verify-Delete operations.
-  Defaults to Dry Run mode if omitted (no files moved/deleted).
+
+Mode flags (mutually exclusive — pick at most one; omitting both runs the
+default Dry Run):
+- --live: Execute physical migration (Copy-Verify-Delete). Source files are
+  moved: deleted after a verified copy lands at the destination. Confirmed
+  exact duplicates are also removed from source once a verified copy of
+  their content exists elsewhere at the destination.
+- --copy: Non-destructive. Same verified Copy-Verify step as --live, but the
+  source file is never deleted or modified afterward. Duplicate source files
+  are also left untouched in this mode — nothing is ever removed from source.
+- (neither of the above): Dry Run — full scan, hashing, and destination-path
+  resolution, exactly like --live/--copy would compute, but no physical
+  action is taken. This is the safe default described in spec §4.1.
 
 System & Python Dependencies:
-- System Binary:
-    - ExifTool (must be installed on host system and available in PATH)
-      Linux: sudo apt install exiftool
-      macOS: brew install exiftool
-      Windows: choco install exiftool
-=======
 - System Binary (recommended, not strictly required — see Date Extraction
   Fallback Chain below for what happens if it's missing):
   - ExifTool
@@ -54,7 +59,6 @@ Date Extraction Fallback Chain:
       multi-camera merges) will end up scattered across the wrong dates.
       pHash generation for RAW files is unaffected either way — that goes
       through rawpy, a separate dependency (see compute_phash()).
->>>>>>> d475aae (More and more changes. Fixed a issue with stale files and db locks. it was ugly)
 """
 
 import argparse
@@ -435,7 +439,15 @@ def get_unique_dest_path(target_path: Path) -> Path:
 
 
 # --- Copy-Verify-Delete Core Protocol ---
-def copy_verify_delete(source_str: str, dest_str: str) -> bool:
+def copy_verify_delete(source_str: str, dest_str: str, delete_source: bool = True) -> bool:
+    """
+    Copies source to dest via a verified temp-file-then-rename sequence.
+    delete_source=True (the --live/move behavior): source is deleted only
+    after the copy is verified byte-for-byte identical — this is the
+    Copy-Verify-Delete protocol from spec §4.3.
+    delete_source=False (the --copy behavior): the copy is still verified
+    the same way, but the source file is left untouched — non-destructive.
+    """
     source = Path(source_str)
     dest = Path(dest_str)
     partial_dest = Path(dest_str + PARTIAL_SUFFIX)
@@ -448,18 +460,21 @@ def copy_verify_delete(source_str: str, dest_str: str) -> bool:
         partial_sha1 = compute_sha1(str(partial_dest))
 
         if src_sha1 != partial_sha1:
-            logger.error(f"SHA1 mismatch during verification for {source.name}. Aborting move.")
+            logger.error(f"SHA1 mismatch during verification for {source.name}. Aborting.")
             if partial_dest.exists():
                 partial_dest.unlink()
             return False
 
         retry_io_operation(f"Rename partial {partial_dest.name}", partial_dest.rename, dest)
-        retry_io_operation(f"Delete original {source.name}", source.unlink)
 
-        logger.info(f"Successfully migrated: {source.name} -> {dest}")
+        if delete_source:
+            retry_io_operation(f"Delete original {source.name}", source.unlink)
+            logger.info(f"Successfully migrated: {source.name} -> {dest}")
+        else:
+            logger.info(f"Successfully copied: {source.name} -> {dest} (source untouched)")
         return True
     except Exception as e:
-        logger.error(f"Failed transactional move for {source_str}: {e}")
+        logger.error(f"Failed transactional copy for {source_str}: {e}")
         if partial_dest.exists():
             try:
                 partial_dest.unlink()
@@ -501,7 +516,19 @@ def main():
     parser.add_argument("--source", default="/data/source", help="Path to source directory (default: /data/source).")
     parser.add_argument("--dest", default="/data/dest", help="Path to destination directory (default: /data/dest).")
     parser.add_argument("--base", default="/appdata", help="Base directory for DB and logs (default: /appdata).")
-    parser.add_argument("--live", action="store_true", help="Execute physical migration (Copy-Verify-Delete). Default is Dry Run.")
+
+    # Only one mode may be active per run — default (no flag) is the existing
+    # Dry Run: full scan + hash + date/dest-path resolution, no physical
+    # action. The three flags below are mutually exclusive with each other.
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--live", action="store_true",
+        help="Execute physical migration (Copy-Verify-Delete, source files are moved/deleted)."
+    )
+    mode_group.add_argument(
+        "--copy", action="store_true",
+        help="Non-destructive: copy source files to destination, verified, but never delete or modify the source."
+    )
     args = parser.parse_args()
 
     # 1. Resolve Base Path & Setup Subdirectories
@@ -522,7 +549,9 @@ def main():
         logger.error(f"Source path does not exist: {source_path}")
         return
 
-    logger.info(f"Initializing LensLogic Engine. Base Directory: {base_dir}")
+    mode_label = "COPY" if args.copy else ("LIVE" if args.live else "DRY RUN")
+    logger.info(f"Initializing LensLogic Engine. Mode: {mode_label}")
+    logger.info(f"Base Directory: {base_dir}")
     logger.info(f"Source Directory: {source_path}")
     logger.info(f"Destination Directory: {dest_path}")
     logger.info(f"Database Path: {db_path}")
@@ -550,10 +579,11 @@ def main():
     result_queue.put(None)
     db_thread.join()
 
-    logger.info("Scan and Dry-Run indexing completed successfully. Database updated.")
+    logger.info("Scan and indexing completed successfully. Database updated.")
 
-    if args.live:
-        logger.info("Live Mode enabled. Initiating Pre-flight Space Checks...")
+    if args.live or args.copy:
+        action_verb = "Moving" if args.live else "Copying"
+        logger.info(f"{'Live' if args.live else 'Copy'} Mode enabled. Initiating Pre-flight Space Checks...")
         conn = get_db_connection(str(db_path))
         cursor = conn.cursor()
         cursor.execute("SELECT id, source_path, dest_path FROM photos WHERE status = 'Pending'")
@@ -564,68 +594,72 @@ def main():
         )
 
         if not verify_sufficient_disk_space(dest_path, total_bytes_needed):
-            logger.error("Aborting migration due to insufficient space on destination drive.")
+            logger.error("Aborting due to insufficient space on destination drive.")
             conn.close()
             return
 
-        logger.info(f"Disk space verified. Moving {len(pending_records)} items ({total_bytes_needed / (1024 ** 2):.2f} MB)...")
+        logger.info(
+            f"Disk space verified. {action_verb} {len(pending_records)} items "
+            f"({total_bytes_needed / (1024 ** 2):.2f} MB)..."
+        )
 
         for record_id, src, dst in pending_records:
             cursor.execute("UPDATE photos SET status = 'Processing' WHERE id = ?", (record_id,))
             conn.commit()
 
-            success = copy_verify_delete(src, dst)
+            # --live deletes the verified source (delete_source=True, the
+            # default); --copy leaves it untouched (delete_source=False).
+            success = copy_verify_delete(src, dst, delete_source=args.live)
 
-            final_status = "Completed" if success else "Failed"
+            if args.live:
+                final_status = "Completed" if success else "Failed"
+            else:
+                final_status = "Copied" if success else "Failed"
             cursor.execute("UPDATE photos SET status = ? WHERE id = ?", (final_status, record_id))
             conn.commit()
 
-        # FIX: actually perform the "Remove identical files" primary goal
-        # (spec §1) for exact duplicates. Previously a duplicate was only
-        # ever flagged status='Duplicate' in the DB — nothing ever deleted
-        # its source file, so no space was ever reclaimed.
-        #
-        # Safety: only delete a duplicate's source file once we've confirmed
-        # a verified copy of that same content successfully landed at the
-        # destination (status='Completed', and the file is actually present
-        # on disk). This avoids the failure mode where the "kept" copy
-        # errors out during its own Copy-Verify-Delete and we'd otherwise be
-        # left with zero surviving copies of that photo anywhere.
-        cursor.execute("SELECT id, source_path, sha1_hash FROM photos WHERE status = 'Duplicate'")
-        duplicate_records = cursor.fetchall()
-        removed_count = 0
-        for record_id, dup_src_str, sha1_hash in duplicate_records:
-            dup_src = Path(dup_src_str)
-            if not dup_src.exists():
-                continue  # already gone (e.g. handled in a prior run)
+        if args.live:
+            # Duplicate source-file removal is a --live-only step. It's
+            # deliberately gated on status='Completed', which only a --live
+            # run ever produces (--copy runs produce 'Copied' instead) — so
+            # this block naturally never touches anything from a --copy run,
+            # keeping --copy fully non-destructive as intended, with no
+            # separate mode check needed here.
+            cursor.execute("SELECT id, source_path, sha1_hash FROM photos WHERE status = 'Duplicate'")
+            duplicate_records = cursor.fetchall()
+            removed_count = 0
+            for record_id, dup_src_str, sha1_hash in duplicate_records:
+                dup_src = Path(dup_src_str)
+                if not dup_src.exists():
+                    continue  # already gone (e.g. handled in a prior run)
 
-            cursor.execute(
-                "SELECT dest_path FROM photos WHERE sha1_hash = ? AND status = 'Completed' LIMIT 1",
-                (sha1_hash,)
-            )
-            match = cursor.fetchone()
-            if match and Path(match[0]).exists():
-                try:
-                    retry_io_operation(f"Deleting verified duplicate {dup_src.name}", dup_src.unlink)
-                    cursor.execute("UPDATE photos SET status = 'Removed_Duplicate' WHERE id = ?", (record_id,))
-                    conn.commit()
-                    removed_count += 1
-                    logger.info(f"Removed duplicate source file: {dup_src} (verified copy at {match[0]})")
-                except Exception as e:
-                    logger.error(f"Failed to remove duplicate source file {dup_src}: {e}")
-            else:
-                logger.warning(
-                    f"No verified copy found on disk for duplicate {dup_src} — "
-                    f"leaving source file in place for safety."
+                cursor.execute(
+                    "SELECT dest_path FROM photos WHERE sha1_hash = ? AND status = 'Completed' LIMIT 1",
+                    (sha1_hash,)
                 )
+                match = cursor.fetchone()
+                if match and Path(match[0]).exists():
+                    try:
+                        retry_io_operation(f"Deleting verified duplicate {dup_src.name}", dup_src.unlink)
+                        cursor.execute("UPDATE photos SET status = 'Removed_Duplicate' WHERE id = ?", (record_id,))
+                        conn.commit()
+                        removed_count += 1
+                        logger.info(f"Removed duplicate source file: {dup_src} (verified copy at {match[0]})")
+                    except Exception as e:
+                        logger.error(f"Failed to remove duplicate source file {dup_src}: {e}")
+                else:
+                    logger.warning(
+                        f"No verified copy found on disk for duplicate {dup_src} — "
+                        f"leaving source file in place for safety."
+                    )
 
-        if duplicate_records:
-            logger.info(f"Duplicate cleanup: removed {removed_count} of {len(duplicate_records)} flagged duplicates.")
+            if duplicate_records:
+                logger.info(f"Duplicate cleanup: removed {removed_count} of {len(duplicate_records)} flagged duplicates.")
 
         conn.close()
-        logger.info("All live file migration operations finished.")
+        logger.info(f"All {'live migration' if args.live else 'copy'} operations finished.")
     else:
-        logger.info("Dry Run finished. Pass the `--live` flag to commit and move files.")
+        logger.info("Dry Run finished. Pass `--live` to move files, or `--copy` to copy them non-destructively.")
 
 
 if __name__ == "__main__":
