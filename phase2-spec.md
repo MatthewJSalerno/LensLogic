@@ -144,7 +144,7 @@ When a job is active, a progress drawer expands at the bottom of the viewport.
 
 * **Metrics:** Active step, progress percentage, active worker count, current DB queue backpressure level, files completed vs. remaining.
 * **Live Log Stream:** Direct source-to-destination mapping display with verification status.
-* **Job Control:** Provides a **Cancel Job** button. Sends `SIGTERM` to the engine subprocess (§6.2 `jobs/{id}/cancel`); the file currently being copy-verified finishes normally, then every remaining targeted file is logged to the `operations` audit table with status `Cancelled` (not silently dropped — visible in the run's history afterward) and duplicate-source cleanup for that run is skipped entirely.
+* **Job Control:** Provides a **Cancel Job** button. Sends `SIGTERM` to the engine subprocess (§6.2 `jobs/{id}/cancel`). During the **Index/scan** phase the engine stops at the next batch boundary and skips the move/copy phase entirely (everything already indexed is kept, so re-running continues where it left off) — note the UI should not expect per-file `Cancelled` rows for a scan-phase cancellation, since no physical work was scoped out yet. During **Move/Copy**, the file currently being copy-verified finishes normally, then every remaining targeted file is logged to the `operations` audit table with status `Cancelled` (not silently dropped — visible in the run's history afterward) and duplicate-source cleanup for that run is skipped entirely.
 * **WebSocket Reconnection & Replay:** On connecting (or reconnecting after a dropped connection or browser refresh — see §5.2), the frontend does **not** assume it saw every event live. It first queries `GET /api/v1/runs/{run_id}/operations` (backed by `SELECT * FROM operations WHERE run_id = ? ORDER BY timestamp`) to backfill the LOGS panel with everything that already happened, then switches to the live WebSocket stream for anything from that point forward. This is what makes "job continues unaffected by a browser refresh" (§5.2) actually true for the *displayed history*, not just the underlying job — without this replay step, a reconnecting client would see progress resume from wherever it currently is with an empty-looking log, even though the job had been running for a while.
 
 ### 4.2 Split-Screen Photo Inspector Panel
@@ -256,6 +256,8 @@ Only one engine process may run at a time — see `project-spec.md` §4.1/§7 fo
 
 ### 6.1 SQLite Schema
 
+Schema changes are versioned with SQLite's built-in `PRAGMA user_version` and applied by the engine on startup (`_migrate_schema`), since `CREATE TABLE IF NOT EXISTS` cannot alter an existing table. **The API layer should not migrate the schema itself** — it opens a database the engine has already brought up to date, and two writers racing migrations on the same file is exactly the kind of thing the single-instance lock exists to prevent. Read `PRAGMA user_version` if the API needs to assert a minimum schema version before serving.
+
 The schema below reflects what's actually implemented in `ns-engine.py`, not a set of `ALTER TABLE` additions on top of the original `photos` table. Error tracking, name-collision flags, and original filenames live in a dedicated **audit log table** rather than as columns bolted onto `photos` — see the design note below for why.
 
 ```sql
@@ -280,6 +282,14 @@ CREATE TABLE photos (
                                    -- generation work lands.
 );
 
+-- Required, not optional. The engine's per-file duplicate check runs once for
+-- EVERY file scanned; without idx_photos_sha1 it degrades to a full scan of a
+-- table that is itself growing with every file (quadratic over library size).
+-- idx_operations_run is what the per-job history view (§5.4) pages over.
+CREATE INDEX idx_photos_sha1 ON photos(sha1_hash);
+CREATE INDEX idx_photos_status ON photos(status);
+CREATE INDEX idx_operations_run ON operations(run_id);
+
 -- runs: one row per engine invocation (Index, Move, or Copy). This is
 -- what "previous run information" (§5.4) is actually built from — no
 -- separate run-history table needed beyond this.
@@ -288,7 +298,15 @@ CREATE TABLE runs (
     mode TEXT NOT NULL,
     source_path TEXT,
     dest_path TEXT,
-    file_ids_filter TEXT,   -- JSON array, NULL for a full directory scan
+    file_ids_filter TEXT,   -- Self-describing JSON object naming which
+                            -- targeting mechanism scoped the run:
+                            --   {"file_ids": [101, 102]}
+                            --   {"source_subdir": "sd_card/day1"}
+                            -- NULL for a full directory scan. (Databases
+                            -- written before --source-subdir existed stored a
+                            -- bare JSON array here; the v0->v1 migration
+                            -- rewrites those, so readers only ever see the
+                            -- object form. Column name kept for compatibility.)
     started_at TEXT NOT NULL,
     ended_at TEXT,
     status TEXT NOT NULL    -- Running, Completed, Cancelled, Failed, Crashed

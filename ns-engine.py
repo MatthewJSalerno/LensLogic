@@ -17,7 +17,18 @@ Runtime Arguments:
   already-cataloged files. A file must have gone through at least one prior
   Index for its ID to exist. This is what powers selection-scoped
   operations from the web UI (Phase 2) — e.g. "Move just these 3 photos" —
-  but works identically from the CLI.
+  but works identically from the CLI. Mutually exclusive with
+  --source-subdir.
+- --source-subdir <path> (Optional) Path, relative to --source, scoping the
+  run to already-cataloged files beneath it. Queries the catalog by
+  source_path prefix instead of walking the filesystem or enumerating IDs,
+  which is what lets the web UI offer "operate on this whole folder" for
+  selections far larger than --file-ids can express (there is a real OS
+  limit on command-line length). Mutually exclusive with --file-ids.
+
+Per-file failures never abort a run: an unreadable, vanished, or otherwise
+unprocessable file is recorded as status='Failed' with a human-readable
+reason in operations.error_message, and the scan carries on with the rest.
 
 Mode flags (mutually exclusive — pick at most one; omitting both runs the
 default Index):
@@ -34,7 +45,10 @@ default Index):
 
 Cancellation: sending SIGTERM or SIGINT (e.g. `docker stop`, or Ctrl+C)
 during a --move/--copy run lets the file currently being copy-verified
-finish, then stops before starting the next one. Every file that didn't get
+finish, then stops before starting the next one. During the Index/scan
+phase it takes effect at the next batch boundary, and a scan cancelled that
+way skips the move/copy phase entirely rather than entering it; everything
+already written to the database is kept, so re-running simply continues. Every file that didn't get
 a chance to run is written to the operations log with status='Cancelled' —
 current, un-started work stays 'Pending' in the photos table (so a plain
 re-run naturally picks it back up), while the operations log keeps a full
@@ -141,6 +155,17 @@ SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.tiff', '.raw', '.dng
 PARTIAL_SUFFIX = ".organizing.partial"
 LOCK_FILENAME = "engine.lock"
 
+# Statuses whose source file is legitimately gone because a prior --move run
+# consumed it on purpose. Targeted re-runs skip these rather than re-scanning
+# them: the source is *supposed* to be missing, so re-indexing would overwrite
+# a real 'Completed' audit state with a spurious 'Failed'.
+SOURCE_CONSUMED_STATUSES = ('Completed', 'Removed_Duplicate')
+
+# Bumped whenever the on-disk schema or the MEANING of a stored value changes.
+# CREATE TABLE IF NOT EXISTS cannot alter an existing table, so anything beyond
+# adding a brand-new table needs a migration step in _migrate_schema().
+SCHEMA_VERSION = 1
+
 # --- Dependency Check ---
 try:
     import imagehash
@@ -203,6 +228,7 @@ class ProcessingResult:
     has_name_collision: bool = False
     collision_group: Optional[int] = None
     is_master: bool = False
+    error_message: Optional[str] = None
 
 
 # --- Producer-Consumer Queue ---
@@ -211,12 +237,25 @@ result_queue = queue.Queue(maxsize=DB_QUEUE_SIZE)
 
 # --- Logging Initialization ---
 def configure_logging(log_dir: Path):
-    """Configures logging to output to console and base/logs/organizer.log."""
+    """
+    Points logging at the console and <base>/logs/organizer.log.
+
+    Called in the main process AND once per worker process (via
+    _init_worker_process), because worker log records must not depend on
+    inheriting the parent's handlers across a fork — see that function for
+    why. basicConfig() is a no-op when the root logger already has handlers,
+    so the fork case keeps exactly what it inherited and only a genuinely
+    unconfigured process (spawn/forkserver) sets up its own.
+
+    The process id is in the format for the same reason: worker records
+    otherwise all claim to be "MainThread" and there is no way to tell which
+    process emitted which line.
+    """
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "organizer.log"
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] (%(threadName)s) %(message)s',
+        format='%(asctime)s [%(levelname)s] (pid:%(process)d/%(threadName)s) %(message)s',
         handlers=[
             logging.StreamHandler(sys.stdout),
             logging.FileHandler(log_file, mode="a", encoding="utf-8")
@@ -327,8 +366,59 @@ def init_database(db_path: str):
             FOREIGN KEY(photo_id) REFERENCES photos(id)
         )
     """)
+
+    # Without these, the per-file duplicate check below (one lookup for EVERY
+    # file scanned) degrades into a full table scan of a table that is itself
+    # growing with every file — quadratic over the size of the library. The
+    # status index does the same job for the Pending/Duplicate sweeps, and
+    # operations(run_id) is what Phase 2's per-job history view will page over.
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_sha1 ON photos(sha1_hash)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_status ON photos(status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_operations_run ON operations(run_id)")
+
     conn.commit()
+    _migrate_schema(conn)
     conn.close()
+
+
+def _migrate_schema(conn: sqlite3.Connection):
+    """
+    Applies any pending schema/data migrations, tracked via PRAGMA
+    user_version (SQLite's built-in per-database integer, untouched by
+    anything else). A fresh database starts at 0 and every migration below
+    is a harmless no-op against empty tables, so new and existing databases
+    both land on SCHEMA_VERSION by the same path.
+    """
+    current = conn.execute("PRAGMA user_version;").fetchone()[0]
+    if current >= SCHEMA_VERSION:
+        return
+
+    if current < 1:
+        # v0 -> v1: runs.file_ids_filter changed from a bare JSON array
+        # ("[1,2,3]") to a self-describing object ('{"file_ids": [1,2,3]}')
+        # when --source-subdir targeting was added and the column had to
+        # express which of two mechanisms scoped the run. Databases written
+        # before that change still hold the array form; rewrite them so
+        # readers only ever have to understand one shape.
+        migrated = 0
+        for run_id, raw in conn.execute(
+            "SELECT id, file_ids_filter FROM runs WHERE file_ids_filter IS NOT NULL"
+        ).fetchall():
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, list):
+                conn.execute(
+                    "UPDATE runs SET file_ids_filter = ? WHERE id = ?",
+                    (json.dumps({"file_ids": parsed}), run_id)
+                )
+                migrated += 1
+        if migrated:
+            logger.info(f"Schema migration v0->v1: rewrote {migrated} legacy run targeting filter(s).")
+
+    conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)};")
+    conn.commit()
 
 
 def start_run(
@@ -473,7 +563,10 @@ def db_writer_worker(db_path: str):
             cursor.execute("SELECT id FROM photos WHERE source_path = ?", (result.file_path,))
             photo_row = cursor.fetchone()
             photo_id = photo_row[0] if photo_row else None
-            log_operation(conn, result.run_id, photo_id, result.file_path, result.dest_path, status)
+            log_operation(
+                conn, result.run_id, photo_id, result.file_path, result.dest_path, status,
+                result.error_message, result.has_name_collision
+            )
         except Exception as e:
             logger.error(f"DB writer failed to record {result.file_path}: {e}")
         finally:
@@ -546,11 +639,32 @@ def reconcile_interrupted_state(db_path: Path):
 
 
 # --- Pre-Flight Space Validation ---
+def _nearest_existing_dir(path: Path) -> Path:
+    """
+    Walks up until it finds a directory that actually exists. Used to ask the
+    filesystem about free space on the volume a not-yet-created path will
+    land on, without creating anything to find out.
+    """
+    for candidate in (path, *path.parents):
+        if candidate.is_dir():
+            return candidate
+    return Path(path.anchor or '.')
+
+
 def verify_sufficient_disk_space(dest_path: Path, required_bytes: int, safety_margin_mb: int = 500) -> bool:
-    """Checks if the destination directory volume has sufficient space available."""
-    check_dir = dest_path if dest_path.exists() else dest_path.parent
-    check_dir.mkdir(parents=True, exist_ok=True)
-    stat = shutil.disk_usage(check_dir)
+    """
+    Checks whether the destination volume has room for `required_bytes`.
+
+    Strictly read-only: this used to mkdir(parents=True) the destination as a
+    side effect of "verifying", so merely asking the question left directory
+    trees behind — including on a run that then aborted for insufficient
+    space, or a --copy against a source that turned out to be empty. Free
+    space is a property of the VOLUME, so querying the nearest existing
+    ancestor answers the same question without writing anything. The real
+    destination directories are created when a file is actually written
+    (copy_verify_delete).
+    """
+    stat = shutil.disk_usage(_nearest_existing_dir(dest_path))
     buffer_bytes = safety_margin_mb * 1024 * 1024
     total_needed = required_bytes + buffer_bytes
 
@@ -587,14 +701,27 @@ def parse_exif_date(value: str) -> Optional[datetime]:
 _worker_exiftool: Optional["pyexiftool.ExifToolHelper"] = None
 
 
-def _init_worker_process(exiftool_supported: bool):
+def _init_worker_process(exiftool_supported: bool, log_dir: Optional[str] = None):
     """
     ProcessPoolExecutor initializer — runs once when each worker process
-    starts, before it's given any files. Sets up this worker's persistent
-    ExifTool instance (if ExifTool is available) and registers cleanup so
-    the subprocess doesn't outlive its parent worker.
+    starts, before it's given any files. Sets up this worker's logging and
+    its persistent ExifTool instance, and registers cleanup so the ExifTool
+    subprocess doesn't outlive its parent worker.
+
+    Logging is configured explicitly here rather than relying on the worker
+    inheriting the parent's handlers, because that inheritance only happens
+    under the `fork` start method. Verified directly: a forked worker sees
+    the parent's handlers and its records reach organizer.log, but a spawned
+    worker has ZERO handlers, so every logger call falls through to
+    logging.lastResort — printed bare to stderr, never written to the log
+    file at all. That is the default on macOS (since 3.8) and Windows, and
+    CPython is moving Linux off plain `fork` as well, so worker-side
+    diagnostics would silently disappear from the log exactly where they are
+    hardest to reproduce.
     """
     global _worker_exiftool
+    if log_dir:
+        configure_logging(Path(log_dir))
     if not exiftool_supported:
         return
     try:
@@ -791,16 +918,115 @@ def compute_phash(file_path: str) -> str:
 
 
 def get_unique_dest_path(target_path: Path) -> Path:
-    if not target_path.exists():
-        return target_path
+    """Thin wrapper kept for callers that only want a free name, no content check."""
+    resolved, _ = resolve_destination(target_path, None)
+    return resolved
+
+
+def resolve_destination(target_path: Path, expected_sha1: Optional[str]) -> tuple:
+    """
+    Finds where this file should actually be written, returning
+    (path, already_present).
+
+    Walks the numeric-suffix chain (name.jpg -> name_1.jpg -> name_2.jpg ...)
+    until it finds a free name. If `expected_sha1` is given and one of the
+    OCCUPIED candidates already holds exactly that content, that file IS this
+    photo — already delivered by an earlier run — and it is returned with
+    already_present=True so the caller can skip rewriting it.
+
+    That content check is what makes re-runs idempotent. Without it, an
+    Index -> Copy -> Index -> Copy cycle multiplied identical files: the
+    re-index reset the row to Pending, the destination name was now taken by
+    the copy the previous cycle made, so the next copy wrote IMG_0001_1.jpg
+    beside it, then IMG_0001_2.jpg, and so on every cycle.
+
+    Suffixes are always built from the ORIGINAL stem. The previous
+    implementation re-suffixed its own output, producing names that grew a
+    segment per collision (IMG_0001_1_2_3.jpg) instead of IMG_0001_3.jpg.
+    """
+    candidate = target_path
     counter = 1
-    while target_path.exists():
-        target_path = target_path.parent / f"{target_path.stem}_{counter}{target_path.suffix}"
+    while candidate.exists():
+        if expected_sha1 and _sha1_of(candidate) == expected_sha1:
+            return candidate, True
+        candidate = target_path.parent / f"{target_path.stem}_{counter}{target_path.suffix}"
         counter += 1
-    return target_path
+    return candidate, False
+
+
+def _sha1_of(path: Path) -> Optional[str]:
+    """SHA-1 of an existing file, or None if it can't be read. Never raises."""
+    try:
+        return compute_sha1(str(path))
+    except Exception:
+        return None
+
+
+def _targeting_predicate(args) -> tuple:
+    """
+    Returns (sql_fragment, params) narrowing a `photos` query to whatever this
+    run was scoped to — a --file-ids list, a --source-subdir prefix, or the
+    whole library. The fragment is written to be appended after an existing
+    WHERE clause.
+
+    Single source of truth deliberately: the Pending sweep and the duplicate
+    cleanup must agree on what "this run" covers, and previously they did not
+    — cleanup ignored targeting entirely and deleted duplicate source files
+    library-wide even for a two-file selection.
+    """
+    if args.file_ids:
+        placeholders = ','.join('?' * len(args.file_ids))
+        return f" AND id IN ({placeholders})", list(args.file_ids)
+    if args.source_subdir:
+        subdir = (Path(args.source).resolve() / args.source_subdir).resolve()
+        return " AND (source_path = ? OR source_path LIKE ?)", [str(subdir), f"{subdir}{os.sep}%"]
+    return "", []
 
 
 # --- Copy-Verify-Delete Core Protocol ---
+class DestinationExistsError(Exception):
+    """
+    Raised when the final destination name is already occupied at the moment
+    the verified partial file is about to be published under it.
+
+    Deliberately NOT an OSError subclass: retry_io_operation() catches
+    OSError to ride out transient network-share hiccups, and retrying a
+    name collision would just burn the backoff delays before failing
+    anyway. This is a permanent condition for this filename, not a blip.
+    """
+
+
+def _finalize_partial(partial_dest: Path, dest: Path):
+    """
+    Publishes the verified partial file under its final name WITHOUT ever
+    overwriting an existing file.
+
+    Path.rename() cannot be used directly here: on POSIX it silently
+    replaces an existing destination, so a same-named file already sitting
+    at `dest` would be destroyed with no error raised and no record kept.
+    os.link() is the atomic alternative — it fails with FileExistsError
+    rather than clobbering — and since the partial always lives in the same
+    directory as its final name, it is always on the same filesystem.
+
+    Filesystems that cannot hard-link (FAT/exFAT on external drives, some
+    network shares) fall back to an explicit existence check plus rename.
+    That leaves a narrow TOCTOU window, but only against a process outside
+    this engine — the single-instance lock plus this loop being serial rules
+    out racing ourselves.
+    """
+    try:
+        os.link(str(partial_dest), str(dest))
+    except FileExistsError:
+        raise DestinationExistsError(f"Destination already exists, refusing to overwrite: {dest}")
+    except OSError:
+        if dest.exists():
+            raise DestinationExistsError(f"Destination already exists, refusing to overwrite: {dest}")
+        partial_dest.rename(dest)
+        return
+    partial_dest.unlink()
+
+
+
 def copy_verify_delete(source_str: str, dest_str: str, delete_source: bool = True) -> tuple:
     """
     Copies source to dest via a verified temp-file-then-rename sequence.
@@ -833,7 +1059,7 @@ def copy_verify_delete(source_str: str, dest_str: str, delete_source: bool = Tru
                 partial_dest.unlink()
             return False, error_message
 
-        retry_io_operation(f"Rename partial {partial_dest.name}", partial_dest.rename, dest)
+        _finalize_partial(partial_dest, dest)
 
         if delete_source:
             retry_io_operation(f"Delete original {source.name}", source.unlink)
@@ -853,36 +1079,73 @@ def copy_verify_delete(source_str: str, dest_str: str, delete_source: bool = Tru
 
 
 # --- Processing Worker ---
-def process_file_task(file_path_str: str, dest_base_path: str, run_id: int) -> ProcessingResult:
-    file_path = Path(file_path_str)
-    sha1 = compute_sha1(str(file_path))
-    phash = compute_phash(str(file_path))
-
-    dt, metadata = get_metadata_and_date(file_path)
-    # Keep an explicit, guaranteed-present date_taken key regardless of which
-    # capture path produced `metadata`, since downstream consumers (path
-    # computation here, and the inspector UI later) shouldn't need to know
-    # ExifTool's exact tag-naming conventions just to find "the date."
-    metadata["date_taken"] = dt.isoformat()
-
-    year_dir = dt.strftime("%Y")
-    month_dir = dt.strftime("%m")
-    day_dir = dt.strftime("%d")
-    target_folder = Path(dest_base_path) / year_dir / month_dir / day_dir
-    initial_dest = target_folder / file_path.name
-    final_dest = get_unique_dest_path(initial_dest)
-    has_collision = (final_dest != initial_dest)
-
+def _failed_result(file_path_str: str, run_id: int, error_message: str) -> ProcessingResult:
+    """Builds the Failed result for a file that could not be scanned at all."""
     return ProcessingResult(
-        file_path=str(file_path),
-        sha1_hash=sha1,
-        phash=phash,
-        metadata=metadata,
-        status="Pending",
-        dest_path=str(final_dest),
-        run_id=run_id,
-        has_name_collision=has_collision
+        file_path=file_path_str, sha1_hash="", phash="", metadata={}, status="Failed",
+        dest_path="", run_id=run_id, error_message=error_message
     )
+
+
+def process_file_task(file_path_str: str, dest_base_path: str, run_id: int) -> ProcessingResult:
+    """
+    Scans one file: SHA-1, pHash, metadata/date, and its projected destination.
+
+    NEVER raises. Any per-file failure comes back as a Failed result carrying
+    a human-readable reason. Previously this function had no error handling at
+    all, so a single unreadable or vanished file propagated its exception out
+    through future.result() in main() and aborted the ENTIRE run — discarding
+    every other file's completed work and leaving no record of which file was
+    responsible.
+    """
+    file_path = Path(file_path_str)
+
+    # Checked explicitly, before any attempt to open the file, so a stale
+    # selection surfaces as a specific reason in the Error Center rather than
+    # a raw FileNotFoundError traceback (project-spec.md §4.4).
+    if not file_path.exists():
+        return _failed_result(
+            file_path_str, run_id,
+            f"Source file changed: no longer found at {file_path}. It may have been moved, "
+            f"renamed, or deleted outside NegativeSpace since the last Index."
+        )
+
+    try:
+        sha1 = compute_sha1(str(file_path))
+        phash = compute_phash(str(file_path))
+
+        dt, metadata = get_metadata_and_date(file_path)
+        # Keep an explicit, guaranteed-present date_taken key regardless of which
+        # capture path produced `metadata`, since downstream consumers (path
+        # computation here, and the inspector UI later) shouldn't need to know
+        # ExifTool's exact tag-naming conventions just to find "the date."
+        metadata["date_taken"] = dt.isoformat()
+
+        year_dir = dt.strftime("%Y")
+        month_dir = dt.strftime("%m")
+        day_dir = dt.strftime("%d")
+        target_folder = Path(dest_base_path) / year_dir / month_dir / day_dir
+
+        # This destination is a PROJECTION, not a reservation, and
+        # has_name_collision stays False here by design. The authoritative
+        # unique-name resolution happens immediately before the file is
+        # actually written (see _run_move_or_copy). Resolving it here instead
+        # was silent data loss: at Index time the destination tree is normally
+        # still empty, so two different photos sharing a filename were both
+        # told the name was free, and whichever got written second overwrote
+        # the first — with both runs reporting success.
+        return ProcessingResult(
+            file_path=str(file_path),
+            sha1_hash=sha1,
+            phash=phash,
+            metadata=metadata,
+            status="Pending",
+            dest_path=str(target_folder / file_path.name),
+            run_id=run_id,
+            has_name_collision=False
+        )
+    except Exception as e:
+        return _failed_result(file_path_str, run_id, f"{type(e).__name__}: {e}")
 
 
 # --- Single-Instance Enforcement ---
@@ -950,6 +1213,51 @@ def release_single_instance_lock(lock_fd):
 
 
 # --- Main Execution ---
+def is_hidden_path(path: Path, root: Path) -> bool:
+    """
+    True if any path segment below `root` starts with a dot.
+
+    Checking every segment, not just the filename, is what makes this cover
+    whole junk trees (.Trashes/, .Spotlight-V100/, .thumbnails/) and not just
+    individual dotfiles.
+
+    The case that actually motivated this: macOS writes an AppleDouble
+    sidecar named "._IMG_0001.jpg" beside every real file on non-HFS volumes
+    (SD cards, USB drives, network shares). Those carry a real photo
+    extension, so the scan happily indexed each one as a photograph —
+    hashing it, failing to find EXIF, filing it by mtime, and on --move
+    dutifully migrating a few KB of resource-fork metadata into the library
+    as if it were a picture. Every SD card import brought a shadow copy of
+    itself. .DS_Store never matched an extension so it was harmless; these
+    were not.
+    """
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        relative = Path(path.name)
+    return any(part.startswith('.') for part in relative.parts)
+
+
+def normalize_extensions(raw: str) -> set:
+    """
+    Parses --exts into the form Path.suffix actually produces.
+
+    Path.suffix ALWAYS includes the leading dot (".jpg"), and the scan
+    compares against it directly — so a user passing the perfectly reasonable
+    `--exts jpg,png` previously matched nothing at all and the run reported
+    "Discovered 0 files" with no hint why. Both spellings are now accepted,
+    along with surrounding whitespace and any casing:
+        ".jpg, PNG , .HEIC"  ->  {".jpg", ".png", ".heic"}
+    """
+    extensions = set()
+    for item in raw.split(','):
+        item = item.strip().lower()
+        if not item:
+            continue
+        extensions.add(item if item.startswith('.') else f".{item}")
+    return extensions
+
+
 def parse_file_ids(value: str) -> List[int]:
     try:
         return [int(x.strip()) for x in value.split(',') if x.strip()]
@@ -961,17 +1269,23 @@ def _query_source_subdir(db_path: str, subdir_filter_path: Path) -> List[str]:
     """
     Looks up already-cataloged `photos.source_path` values falling under
     `subdir_filter_path` (the exact directory itself, or recursively below
-    it), without touching status. Used for Index-mode re-scans scoped to a
-    subdirectory; the Move/Copy targeting path additionally filters on
-    `status = 'Pending'` inline rather than calling this helper.
+    it). Rows whose source a prior --move already consumed on purpose are
+    excluded (SOURCE_CONSUMED_STATUSES); everything else is returned even if
+    the file is missing from disk, so process_file_task can record it as
+    Failed with a real reason instead of it silently vanishing from the run.
+    Used for Index-mode re-scans scoped to a subdirectory; the Move/Copy
+    targeting path additionally filters on `status = 'Pending'` inline
+    rather than calling this helper.
     """
     conn = get_db_connection(db_path)
+    placeholders = ','.join('?' * len(SOURCE_CONSUMED_STATUSES))
     rows = conn.execute(
-        "SELECT id, source_path FROM photos WHERE source_path = ? OR source_path LIKE ?",
-        (str(subdir_filter_path), f"{subdir_filter_path}{os.sep}%")
+        f"SELECT source_path FROM photos WHERE (source_path = ? OR source_path LIKE ?) "
+        f"AND status NOT IN ({placeholders})",
+        (str(subdir_filter_path), f"{subdir_filter_path}{os.sep}%", *SOURCE_CONSUMED_STATUSES)
     ).fetchall()
     conn.close()
-    return [r[1] for r in rows if Path(r[1]).exists()]
+    return [r[0] for r in rows]
 
 
 def main():
@@ -1018,9 +1332,7 @@ def main():
     args = parser.parse_args()
 
     worker_count = args.workers if args.workers else MAX_WORKER_PROCESSES
-    active_extensions = (
-        {e.strip().lower() for e in args.exts.split(',') if e.strip()} if args.exts else SUPPORTED_EXTENSIONS
-    )
+    active_extensions = normalize_extensions(args.exts) if args.exts else SUPPORTED_EXTENSIONS
 
     # 1. Resolve Base Path & Setup Subdirectories
     base_dir = Path(args.base).resolve()
@@ -1124,14 +1436,25 @@ def main():
             conn = get_db_connection(str(db_path))
             placeholders = ','.join('?' * len(args.file_ids))
             rows = conn.execute(
-                f"SELECT id, source_path FROM photos WHERE id IN ({placeholders})", args.file_ids
+                f"SELECT id, source_path, status FROM photos WHERE id IN ({placeholders})", args.file_ids
             ).fetchall()
             conn.close()
             found_ids = {r[0] for r in rows}
             missing = set(args.file_ids) - found_ids
             if missing:
                 logger.warning(f"file-ids not found in database (never indexed?): {sorted(missing)}")
-            files_to_process = [r[1] for r in rows if Path(r[1]).exists()]
+            already_done = [r for r in rows if r[2] in SOURCE_CONSUMED_STATUSES]
+            if already_done:
+                logger.info(
+                    f"Skipping {len(already_done)} targeted file(s) already completed by a prior run — "
+                    f"their source was removed on purpose."
+                )
+            # Files missing for any OTHER reason are deliberately NOT filtered
+            # out: they flow through to process_file_task, which records each
+            # one as Failed with a specific reason. Dropping them here (the
+            # previous behavior) made a stale selection silently shrink, with
+            # nothing in the audit log explaining where those files went.
+            files_to_process = [r[1] for r in rows if r[2] not in SOURCE_CONSUMED_STATUSES]
             logger.info(f"Targeting {len(files_to_process)} of {len(args.file_ids)} requested file IDs.")
         elif subdir_filter_path is not None:
             # Same idea as --file-ids: query already-cataloged rows instead of
@@ -1142,31 +1465,64 @@ def main():
         else:
             files_to_process = [
                 str(p) for p in source_path.rglob('*')
-                if p.is_file() and not p.is_symlink() and p.suffix.lower() in active_extensions
+                if p.is_file() and not p.is_symlink()
+                and p.suffix.lower() in active_extensions
+                and not is_hidden_path(p, source_path)
             ]
-            logger.info(f"Discovered {len(files_to_process)} supported photo/image files to scan.")
+            logger.info(
+                f"Discovered {len(files_to_process)} supported photo/image files to scan "
+                f"(extensions: {', '.join(sorted(active_extensions))})."
+            )
 
+        # Submitted in bounded batches rather than all at once. Every
+        # completed future holds its ProcessingResult — including the FULL
+        # ExifTool tag set for that file — until it is drained, so submitting
+        # an entire library up front made peak memory scale with the number of
+        # photos (hundreds of MB to GBs on a large collection) no matter how
+        # small the queue's maxsize was. Batching also gives cancellation a
+        # checkpoint: previously SIGTERM was not looked at once during the
+        # whole scan, so Cancel Job (and `docker stop`, which escalates to
+        # SIGKILL after ~10s) did nothing at all on a long Index.
+        scan_batch_size = max(worker_count * 4, 16)
+        scanned = 0
         with ProcessPoolExecutor(
             max_workers=worker_count,
             initializer=_init_worker_process,
-            initargs=(EXIFTOOL_SUPPORTED,)
+            initargs=(EXIFTOOL_SUPPORTED, str(log_dir))
         ) as executor:
-            futures = [executor.submit(process_file_task, f, str(dest_path), run_id) for f in files_to_process]
-            for future in futures:
-                res = future.result()
-                result_queue.put(res)
+            for batch_start in range(0, len(files_to_process), scan_batch_size):
+                if cancel_requested.is_set():
+                    logger.warning(
+                        f"Cancellation requested — stopping scan after {scanned} of "
+                        f"{len(files_to_process)} file(s). Nothing already written to the "
+                        f"database is lost; re-run to continue."
+                    )
+                    break
+                batch = files_to_process[batch_start:batch_start + scan_batch_size]
+                futures = [executor.submit(process_file_task, f, str(dest_path), run_id) for f in batch]
+                for future in futures:
+                    result_queue.put(future.result())
+                scanned += len(batch)
 
         result_queue.join()
         result_queue.put(None)
         db_thread.join()
 
-        logger.info("Scan and indexing completed successfully. Database updated.")
-
-        if args.move or args.copy:
-            run_outcome = _run_move_or_copy(args, db_path, dest_path, run_id)
+        if cancel_requested.is_set():
+            logger.info(
+                f"Scan cancelled after {scanned} file(s) — skipping the move/copy phase. "
+                f"Everything already indexed is saved; re-run to continue."
+            )
+            run_outcome = "Cancelled"
         else:
-            run_outcome = "Completed"
-            logger.info("Index finished. Pass `--move` to move files, or `--copy` to copy them non-destructively.")
+            logger.info(f"Scan and indexing completed successfully ({scanned} file(s)). Database updated.")
+            if args.move or args.copy:
+                run_outcome = _run_move_or_copy(args, db_path, dest_path, run_id)
+            else:
+                run_outcome = "Completed"
+                logger.info(
+                    "Index finished. Pass `--move` to move files, or `--copy` to copy them non-destructively."
+                )
 
     finally:
         if cancel_requested.is_set() and run_outcome != "Cancelled":
@@ -1192,21 +1548,11 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
     conn = get_db_connection(str(db_path))
     cursor = conn.cursor()
 
-    if args.file_ids:
-        placeholders = ','.join('?' * len(args.file_ids))
-        cursor.execute(
-            f"SELECT id, source_path, dest_path FROM photos WHERE status = 'Pending' AND id IN ({placeholders})",
-            args.file_ids
-        )
-    elif args.source_subdir:
-        subdir_filter_path = (Path(args.source).resolve() / args.source_subdir).resolve()
-        cursor.execute(
-            "SELECT id, source_path, dest_path FROM photos WHERE status = 'Pending' AND "
-            "(source_path = ? OR source_path LIKE ?)",
-            (str(subdir_filter_path), f"{subdir_filter_path}{os.sep}%")
-        )
-    else:
-        cursor.execute("SELECT id, source_path, dest_path FROM photos WHERE status = 'Pending'")
+    predicate, predicate_params = _targeting_predicate(args)
+    cursor.execute(
+        "SELECT id, source_path, dest_path FROM photos WHERE status = 'Pending'" + predicate,
+        predicate_params
+    )
     pending_records = cursor.fetchall()
 
     total_bytes_needed = sum(
@@ -1233,16 +1579,68 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
                 log_operation(conn, run_id, cancelled_id, cancelled_src, cancelled_dst, "Cancelled")
             break
 
-        cursor.execute("SELECT has_name_collision FROM photos WHERE id = ?", (record_id,))
-        collision_row = cursor.fetchone()
-        has_collision = bool(collision_row[0]) if collision_row else False
+        # Resolve the final filename HERE, immediately before the file is
+        # written — not back at Index time. project-spec.md §4.3 requires the
+        # check to happen "before writing to a computed destination path", and
+        # the distinction is not academic: at Index time the destination tree
+        # is normally empty, so every same-named file is told its name is free.
+        # Two different photos named IMG_0001.jpg (two camera cards, say) would
+        # both be assigned the identical destination, and the second one moved
+        # would silently destroy the first — source already deleted, both
+        # operations reporting success. By this point in the run, anything
+        # already written is really on disk, so exists() answers truthfully.
+        already_present = False
+        resolved_path = Path(dst)
+        if resolved_path.exists():
+            # Only hash when the name is actually contested — the common case
+            # (free name) pays nothing. The source is re-hashed live rather
+            # than trusting the indexed value, so a source edited since the
+            # last Index can never be mistaken for "already delivered."
+            resolved_path, already_present = resolve_destination(Path(dst), _sha1_of(Path(src)))
+        resolved_dst = str(resolved_path)
+        has_collision = (resolved_dst != dst)
+
+        if already_present:
+            # An identical copy is already sitting at the destination from an
+            # earlier run. Re-copying would just create IMG_0001_1.jpg beside
+            # it, and another one next cycle. For --move the operation is still
+            # completed by removing the now-redundant source.
+            if args.move:
+                try:
+                    retry_io_operation(f"Delete already-copied source {Path(src).name}", Path(src).unlink)
+                    final_status = "Completed"
+                    skip_error = None
+                except Exception as e:
+                    final_status = "Failed"
+                    skip_error = f"{type(e).__name__}: {e}"
+            else:
+                final_status = "Copied"
+                skip_error = None
+            logger.info(f"Already present at destination, skipping copy: {Path(src).name} -> {resolved_dst}")
+            cursor.execute(
+                "UPDATE photos SET status = ?, dest_path = ? WHERE id = ?",
+                (final_status, resolved_dst, record_id)
+            )
+            conn.commit()
+            log_operation(conn, run_id, record_id, src, resolved_dst, final_status, skip_error, has_collision)
+            continue
+
+        if has_collision:
+            logger.info(
+                f"Destination name already taken by different content — writing "
+                f"{Path(dst).name} as {Path(resolved_dst).name} instead."
+            )
+            cursor.execute(
+                "UPDATE photos SET dest_path = ?, has_name_collision = 1 WHERE id = ?",
+                (resolved_dst, record_id)
+            )
 
         cursor.execute("UPDATE photos SET status = 'Processing' WHERE id = ?", (record_id,))
         conn.commit()
 
         # --move deletes the verified source (delete_source=True, the
         # default); --copy leaves it untouched (delete_source=False).
-        success, error_message = copy_verify_delete(src, dst, delete_source=args.move)
+        success, error_message = copy_verify_delete(src, resolved_dst, delete_source=args.move)
 
         if args.move:
             final_status = "Completed" if success else "Failed"
@@ -1250,7 +1648,7 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
             final_status = "Copied" if success else "Failed"
         cursor.execute("UPDATE photos SET status = ? WHERE id = ?", (final_status, record_id))
         conn.commit()
-        log_operation(conn, run_id, record_id, src, dst, final_status, error_message, has_collision)
+        log_operation(conn, run_id, record_id, src, resolved_dst, final_status, error_message, has_collision)
 
     if args.move and not was_cancelled:
         # Duplicate source-file removal is a --move-only step. It's
@@ -1262,7 +1660,13 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
         # cancelled, since acting on duplicates from a run that didn't
         # finish its primary moves could delete a source file whose "kept"
         # copy was itself never confirmed.
-        cursor.execute("SELECT id, source_path, sha1_hash FROM photos WHERE status = 'Duplicate'")
+        # Scoped to whatever this run targeted. Previously this swept the
+        # WHOLE library regardless: a two-file --file-ids move would happily
+        # delete duplicate source files nowhere near the user's selection.
+        cursor.execute(
+            "SELECT id, source_path, sha1_hash FROM photos WHERE status = 'Duplicate'" + predicate,
+            predicate_params
+        )
         duplicate_records = cursor.fetchall()
         removed_count = 0
         for record_id, dup_src_str, sha1_hash in duplicate_records:
