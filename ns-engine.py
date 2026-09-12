@@ -331,14 +331,29 @@ def init_database(db_path: str):
     conn.close()
 
 
-def start_run(db_path: str, mode: str, source_path: str, dest_path: str, file_ids: Optional[List[int]]) -> int:
-    """Inserts the `runs` row for this invocation and returns its id."""
+def start_run(
+    db_path: str, mode: str, source_path: str, dest_path: str,
+    file_ids: Optional[List[int]], source_subdir: Optional[str] = None
+) -> int:
+    """
+    Inserts the `runs` row for this invocation and returns its id.
+    `file_ids` and `source_subdir` are mutually exclusive targeting
+    mechanisms (enforced at the CLI level) — at most one is ever set.
+    Persisted as a self-describing JSON object so the audit trail can tell
+    which targeting mechanism (if any) scoped the run.
+    """
+    if file_ids:
+        targeting_filter = json.dumps({"file_ids": file_ids})
+    elif source_subdir:
+        targeting_filter = json.dumps({"source_subdir": source_subdir})
+    else:
+        targeting_filter = None
     conn = get_db_connection(db_path)
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO runs (mode, source_path, dest_path, file_ids_filter, started_at, status) "
         "VALUES (?, ?, ?, ?, ?, 'Running')",
-        (mode, source_path, dest_path, json.dumps(file_ids) if file_ids else None, datetime.now().isoformat())
+        (mode, source_path, dest_path, targeting_filter, datetime.now().isoformat())
     )
     conn.commit()
     run_id = cursor.lastrowid
@@ -942,6 +957,23 @@ def parse_file_ids(value: str) -> List[int]:
         raise argparse.ArgumentTypeError(f"--file-ids must be a comma-separated list of integers, got: {value}")
 
 
+def _query_source_subdir(db_path: str, subdir_filter_path: Path) -> List[str]:
+    """
+    Looks up already-cataloged `photos.source_path` values falling under
+    `subdir_filter_path` (the exact directory itself, or recursively below
+    it), without touching status. Used for Index-mode re-scans scoped to a
+    subdirectory; the Move/Copy targeting path additionally filters on
+    `status = 'Pending'` inline rather than calling this helper.
+    """
+    conn = get_db_connection(db_path)
+    rows = conn.execute(
+        "SELECT id, source_path FROM photos WHERE source_path = ? OR source_path LIKE ?",
+        (str(subdir_filter_path), f"{subdir_filter_path}{os.sep}%")
+    ).fetchall()
+    conn.close()
+    return [r[1] for r in rows if Path(r[1]).exists()]
+
+
 def main():
     parser = argparse.ArgumentParser(description="NegativeSpace - Photo Collection Organizer (Phase 1 Engine)")
     parser.add_argument("--source", default="/data/source", help="Path to source directory (default: /data/source).")
@@ -956,10 +988,19 @@ def main():
         help="Comma-separated list of extensions to scan (e.g. '.jpg,.png'), replacing the built-in default set. "
              "Only affects directory scanning, not --file-ids targeting."
     )
-    parser.add_argument(
+    targeting_group = parser.add_mutually_exclusive_group()
+    targeting_group.add_argument(
         "--file-ids", type=parse_file_ids, default=None,
         help="Comma-separated list of existing photo IDs (from a prior Index) to target. "
              "Bypasses the full directory scan — processes exactly these already-cataloged files."
+    )
+    targeting_group.add_argument(
+        "--source-subdir", type=str, default=None,
+        help="Path, relative to --source, to scope this run to. Queries already-cataloged rows whose "
+             "source_path falls under <source>/<subdir> instead of walking the filesystem or enumerating "
+             "--file-ids — the mechanism behind the web UI's folder-selection option for batches too large "
+             "for --file-ids. Only reflects files known as of the last Index over that path. "
+             "Mutually exclusive with --file-ids."
     )
 
     # Only one mode may be active per run — default (no flag) is the existing
@@ -1027,6 +1068,23 @@ def main():
         release_single_instance_lock(lock_fd)
         return
 
+    # --source-subdir scopes targeting to already-indexed rows under this
+    # path, rather than re-walking the filesystem or enumerating IDs. Resolve
+    # it now and confirm it doesn't escape --source (e.g. via `..` segments)
+    # before it's ever used in a query.
+    subdir_filter_path = None
+    if args.source_subdir:
+        subdir_filter_path = (source_path / args.source_subdir).resolve()
+        try:
+            subdir_filter_path.relative_to(source_path)
+        except ValueError:
+            logger.error(
+                f"--source-subdir must resolve to a path under --source ({source_path}); "
+                f"got: {subdir_filter_path}"
+            )
+            release_single_instance_lock(lock_fd)
+            sys.exit(1)
+
     mode_label = "COPY" if args.copy else ("MOVE" if args.move else "INDEX")
     logger.info(f"Initializing NegativeSpace Engine. Mode: {mode_label}")
     logger.info(f"Base Directory: {base_dir}")
@@ -1035,6 +1093,8 @@ def main():
     logger.info(f"Database Path: {db_path}")
     if args.file_ids:
         logger.info(f"Targeted file IDs: {args.file_ids}")
+    if subdir_filter_path is not None:
+        logger.info(f"Targeted source subdirectory: {subdir_filter_path}")
 
     # 3. Schema + Startup Recovery
     init_database(str(db_path))
@@ -1047,7 +1107,9 @@ def main():
     # forever from a crash.
     signal.signal(signal.SIGTERM, _handle_cancel_signal)
     signal.signal(signal.SIGINT, _handle_cancel_signal)
-    run_id = start_run(str(db_path), mode_label, str(source_path), str(dest_path), args.file_ids)
+    run_id = start_run(
+        str(db_path), mode_label, str(source_path), str(dest_path), args.file_ids, args.source_subdir
+    )
     run_outcome = "Failed"
 
     try:
@@ -1071,6 +1133,12 @@ def main():
                 logger.warning(f"file-ids not found in database (never indexed?): {sorted(missing)}")
             files_to_process = [r[1] for r in rows if Path(r[1]).exists()]
             logger.info(f"Targeting {len(files_to_process)} of {len(args.file_ids)} requested file IDs.")
+        elif subdir_filter_path is not None:
+            # Same idea as --file-ids: query already-cataloged rows instead of
+            # walking the filesystem. Only rows from a prior Index over this
+            # path are visible — a fresh subtree needs a full scan first.
+            files_to_process = _query_source_subdir(str(db_path), subdir_filter_path)
+            logger.info(f"Targeting {len(files_to_process)} already-indexed file(s) under source subdirectory.")
         else:
             files_to_process = [
                 str(p) for p in source_path.rglob('*')
@@ -1129,6 +1197,13 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
         cursor.execute(
             f"SELECT id, source_path, dest_path FROM photos WHERE status = 'Pending' AND id IN ({placeholders})",
             args.file_ids
+        )
+    elif args.source_subdir:
+        subdir_filter_path = (Path(args.source).resolve() / args.source_subdir).resolve()
+        cursor.execute(
+            "SELECT id, source_path, dest_path FROM photos WHERE status = 'Pending' AND "
+            "(source_path = ? OR source_path LIKE ?)",
+            (str(subdir_filter_path), f"{subdir_filter_path}{os.sep}%")
         )
     else:
         cursor.execute("SELECT id, source_path, dest_path FROM photos WHERE status = 'Pending'")
