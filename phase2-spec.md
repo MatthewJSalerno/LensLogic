@@ -2,7 +2,7 @@
 
 ## 1. System Overview & Architecture
 
-The LensLogic Web Interface provides a modern web UI for the containerized Python Phase 1 engine (`phase1-organize.py`). It transforms the CLI engine into an interactive application supporting real-time operation monitoring, selective file processing, context-aware duplicate resolution, detailed metadata inspection, dedicated runtime settings management, extension validation, and audit logging.
+The LensLogic Web Interface provides a modern web UI for the containerized Python Phase 1 engine (`lenslogic_engine.py`). It transforms the CLI engine into an interactive application supporting real-time operation monitoring, selective file processing, context-aware duplicate resolution, detailed metadata inspection, dedicated runtime settings management, extension validation, and audit logging.
 
 ```
 +-----------------------------------------------------------------------------------+
@@ -17,7 +17,8 @@ The LensLogic Web Interface provides a modern web UI for the containerized Pytho
 | SQLite (WAL) / Subprocess
 +-----------------------------------------------------------------------------------+
 |                             Phase 1 Engine Core                                   |
-|   (phase1-organize.py --workers N --exts ex1,ex2 --file-ids id1,id2)              |
+|   (lenslogic_engine.py --workers N --exts ex1,ex2 --file-ids id1,id2               |
+|                        --source-subdir path)                                      |
 +-----------------------------------------------------------------------------------+
 ```
 
@@ -31,25 +32,30 @@ The LensLogic Web Interface provides a modern web UI for the containerized Pytho
 ```
 1. User triggers an Index scan (full directory or, on a repeat visit,
    just a "Rescan" to pick up newly added files).
-   -> FastAPI spawns: python3 phase1-organize.py
+   -> FastAPI checks for an already-active job (409 if one exists, §5.5)
+   -> FastAPI spawns: python3 lenslogic_engine.py
    -> Engine scans the full source directory, hashes everything, flags
       duplicates, captures metadata, and populates SQLite.
 
 2. Frontend queries the catalog (paginated/filterable) and renders it
    as a browsable, selectable grid (Gallery view).
 
-3. User selects one or more files and chooses an operation: Move or Copy.
+3. User selects one or more files (or a folder, for large batches — see
+   §2's Selective File Processing) and chooses an operation: Move or Copy.
 
-4. Frontend POSTs the selected file IDs + operation to FastAPI
+4. Frontend POSTs the selection + operation to FastAPI
    (`POST /api/v1/jobs/start`, see §6.2).
 
-5. FastAPI spawns the engine again, this time scoped:
-   python3 phase1-organize.py --move --file-ids 101,102,105  (or --copy)
+5. FastAPI re-checks for an active job (409 if one exists), then spawns
+   the engine, scoped one of two ways:
+   python3 lenslogic_engine.py --move --file-ids 101,102,105  (or --copy)
+   python3 lenslogic_engine.py --move --source-subdir sd_card/day1
 
 6. Job progress streams back to the frontend via WebSocket, reusing the
    engine's own status transitions (Pending -> Processing ->
    Completed/Failed/Removed_Duplicate) rather than a separate progress
-   protocol.
+   protocol. Any client connecting or reconnecting first replays
+   `GET /api/v1/runs/{run_id}/operations` before tailing live (§4.1).
 
 7. Frontend updates the Gallery/Operations Drawer in real time as rows
    change status.
@@ -67,15 +73,19 @@ The UI allows switching between execution modes prior to triggering operations:
 
 ### Selective File Processing
 Users can select individual files or multiple files across grid views to run targeted operations.
-* **Multi-Select Controls:** Checkboxes on photo cards, Shift-click range selections, "Select all on page," and "Select all matching current filter" (e.g. every `Pending` file) — the latter matters for large libraries where scrolling to individually check hundreds of thumbnails isn't practical.
-* **Sticky Action Bar:** Appears when items are selected, presenting **Move Selected** and **Copy Selected** actions.
-* **Targeted Execution:** Uses the `--file-ids <id1,id2>` flag in `phase1-organize.py` to bypass full directory scanning and process only specified database records. IDs were chosen over passing raw file paths specifically because a database primary key is unambiguous and doesn't depend on path strings staying identical between when the frontend fetched the catalog and when the operation actually runs — and it gives the CLI the exact same targeting capability the web UI uses, with no web-only code path.
+* **Multi-Select Controls:** Checkboxes on photo cards, Shift-click range selections, and "Select all on page."
+* **Selection size limit:** Individual multi-select (including "Select all on page") is capped at a configurable maximum (default: 1,000 files) per job submission — this isn't an arbitrary UX restriction, it's because each selected file becomes an integer in the `--file-ids` command-line argument passed to the engine, and there's a real OS limit on total command-line length. Exceeding the cap shows a clear message (e.g. *"1,000 file limit for individual selection — try Folder Selection below for larger batches"*) rather than silently truncating the selection or attempting a job that might fail at spawn time.
+* **Folder Selection (for large batches):** Instead of "select all matching current filter" against individual files, users can select a source folder (recursive) and scope the operation to everything currently indexed under it. This maps directly to the engine's `--source-subdir <path>` flag (`project-spec.md` §4.1) rather than enumerating individual IDs, which sidesteps the command-line length limit entirely — there's no practical upper bound on how many files a folder selection can cover. Symlinks are excluded automatically, inherited from the original Index that populated the catalog (a symlink was never indexed as a row in the first place). If a folder hasn't been indexed yet (zero matching rows), show *"No indexed files found under this folder — run an Index first."*
+* **Sticky Action Bar:** Appears when items (individual or folder) are selected, presenting **Move Selected** and **Copy Selected** actions.
+* **Targeted Execution:** Individual selections use the `--file-ids <id1,id2>` flag; folder selections use `--source-subdir <path>`. These are mutually exclusive targeting mechanisms in a single job — pick one per submission. IDs (not raw file paths) were chosen for the individual case specifically because a database primary key is unambiguous and doesn't depend on path strings staying identical between when the frontend fetched the catalog and when the operation actually runs — and it gives the CLI the exact same targeting capability the web UI uses, with no web-only code path.
 
 ---
 
 ## 3. Dedicated Settings Management (`/settings`)
 
 A dedicated Settings view provides central management of engine parameters, persisted to SQLite and passed to engine instances on startup.
+
+**Settings changes never affect an already-running operation.** Every engine invocation reads its configuration once, at spawn time, as CLI flags (`--workers`, `--exts`) — there's no live-reload path, by design (see `project-spec.md` §4.1). Saving new settings in this panel only affects jobs started *after* the save. If a user wants a change applied to work that's currently in progress, they need to cancel the running job (§4.1's Cancel Job) and start it again — at which point the new settings apply from that fresh invocation. The Settings UI should make this explicit (e.g. a note near Save: *"Changes apply to new operations only — cancel and restart an in-progress job to apply immediately"*) rather than implying a change takes effect instantly everywhere.
 
 ```
 +---------------------------------------------------------------------------------+
@@ -135,6 +145,7 @@ When a job is active, a progress drawer expands at the bottom of the viewport.
 * **Metrics:** Active step, progress percentage, active worker count, current DB queue backpressure level, files completed vs. remaining.
 * **Live Log Stream:** Direct source-to-destination mapping display with verification status.
 * **Job Control:** Provides a **Cancel Job** button. Sends `SIGTERM` to the engine subprocess (§6.2 `jobs/{id}/cancel`); the file currently being copy-verified finishes normally, then every remaining targeted file is logged to the `operations` audit table with status `Cancelled` (not silently dropped — visible in the run's history afterward) and duplicate-source cleanup for that run is skipped entirely.
+* **WebSocket Reconnection & Replay:** On connecting (or reconnecting after a dropped connection or browser refresh — see §5.2), the frontend does **not** assume it saw every event live. It first queries `GET /api/v1/runs/{run_id}/operations` (backed by `SELECT * FROM operations WHERE run_id = ? ORDER BY timestamp`) to backfill the LOGS panel with everything that already happened, then switches to the live WebSocket stream for anything from that point forward. This is what makes "job continues unaffected by a browser refresh" (§5.2) actually true for the *displayed history*, not just the underlying job — without this replay step, a reconnecting client would see progress resume from wherever it currently is with an empty-looking log, even though the job had been running for a while.
 
 ### 4.2 Split-Screen Photo Inspector Panel
 Clicking an image opens a right-side 50% detail panel.
@@ -194,14 +205,14 @@ The Gallery grid and Inspector's "Media Preview" both need something to actually
 Before initiating any move or copy job, the system computes total payload size plus a 500 MB safety buffer. If destination disk space is insufficient, execution is blocked and a warning banner displays required vs. available space.
 
 ### 5.2 Job Persistence & Background Execution
-Jobs run asynchronously in FastAPI. If a user closes or refreshes their browser, the job continues unaffected. Reopening the web UI re-establishes the WebSocket connection to stream live progress.
+Jobs run asynchronously in FastAPI. If a user closes or refreshes their browser, the job continues unaffected. Reopening the web UI re-establishes the WebSocket connection and replays the operations log for that run (§4.1's WebSocket Reconnection & Replay) to stream live progress with full history intact, not just progress from the reconnection point forward.
 
 ### 5.3 Error Center
 If operations fail, an Error Banner highlights the failures, sourced directly from the `operations` log's `error_message` column (see §6.1) — the real exception text is persisted, not just a generic "failed" flag.
 
 ```
 +-----------------------------------------------------------------------------------+
-| FAILED OPERATIONS (2 Items)                                                       |
+| FAILED OPERATIONS (3 Items)                                                       |
 +-----------------------------------------------------------------------------------+
 | 1. IMG_0488.CR2                                                                    |
 |    Source: /data/source/imports/IMG_0488.CR2                                      |
@@ -210,10 +221,16 @@ If operations fail, an Error Banner highlights the failures, sourced directly fr
 | 2. IMG_0912.JPG                                                                   |
 |    Source: /data/source/corrupted/IMG_0912.JPG                                   |
 |    Error:  ChecksumMismatch: SHA-1 verification failed                            |
+|                                                                                   |
+| 3. IMG_1050.JPG                                                                   |
+|    Source: /data/source/sd_card/IMG_1050.JPG                                     |
+|    Error:  Source file changed: no longer found at /data/source/sd_card/         |
+|            IMG_1050.JPG. It may have been moved, renamed, or deleted outside      |
+|            LensLogic since the last Index.                                       |
 +-----------------------------------------------------------------------------------+
 ```
 
-Users can view exact system error strings (e.g., `PermissionError`, `ChecksumMismatch`).
+Users can view exact system error strings (e.g., `PermissionError`, `ChecksumMismatch`, `Source file changed`). The distinct wording on the third case (`project-spec.md` §4.2) is intentional — it should read differently from a permissions/disk failure, since the fix is "run an Index" rather than "check destination permissions."
 
 **No dedicated retry subsystem.** There is no "Retry Item" / "Retry All Failed" backend endpoint and no `retry_count` tracking. A failed file's `photos.status` is reset to `Pending` automatically the next time it's re-indexed (a plain re-scan, full or `--file-ids`-scoped), so retrying is just re-running the same operation — files that already succeeded are gone from `--source` and won't be touched again, so this is fast even for a large batch with only a few failures. The web UI's equivalent of "retry" is simply selecting the failed items (they're still visible with `status = 'Failed'`) and re-issuing the same Move/Copy operation via `POST /api/v1/jobs/start` with their IDs in `file_ids` — no new endpoint required.
 
@@ -222,13 +239,24 @@ A searchable table logging every operation performed by the engine:
 * **Columns:** Timestamp, Mode (`MOVE`/`COPY`), Source Path, Destination Path, Status (`Completed`, `Copied`, `Removed_Duplicate`, `Failed`), and System Error Message.
 * **Controls:** Filter by date, status, or free-text search; CSV/JSON export.
 
+### 5.5 Single Active Job Enforcement
+
+Only one engine process may run at a time — see `project-spec.md` §4.1/§7 for the engine-level guarantee (an OS-level `flock`, held for the whole process lifetime, released automatically even on a hard `SIGKILL`). This is enforced in two layers, not one:
+
+* **Fast pre-check (FastAPI):** Before spawning the engine, `POST /api/v1/jobs/start` checks `SELECT COUNT(*) FROM runs WHERE status = 'Running'`. If non-zero, it returns `409 Conflict` immediately — no subprocess is spawned, and the response includes the active run's `id`, `mode`, and `started_at` so the frontend can show *"A Move operation is already in progress (started 2 minutes ago) — wait for it to finish or cancel it."* The Rescan/Move/Copy/Settings-Save buttons should all be disabled client-side whenever a job is known to be active, so this 409 is a backstop for races (e.g. two tabs), not the primary UX.
+* **Authoritative guarantee (engine):** The `flock` in `project-spec.md` §4.1 is what actually prevents data corruption if the fast check above is ever wrong or stale — see the FastAPI-restart case below. Even if FastAPI's own bookkeeping says "nothing running" incorrectly, a second engine process attempting to start will still be refused by the lock and exit cleanly with a logged error, never silently racing a real in-progress run.
+
+**FastAPI-restart edge case:** if FastAPI itself restarts (redeploy, crash) while a job is running, its in-memory job/WebSocket-subscriber state is lost, but the engine subprocess is *not* killed by its parent dying — it keeps running under the protection of its own lock. On startup, FastAPI should reconcile this by querying `runs` for any `status = 'Running'` row. Two cases:
+1. **The engine process is genuinely still alive** (the common case) — FastAPI should treat this as an active job for UI purposes (allow reconnecting clients to replay/stream it per §4.1) without being able to directly re-attach to the subprocess's stdout; the `operations` log is what makes this possible without that direct attachment.
+2. **The engine process crashed too, before its own next-run reconciliation ever got a chance to mark that row `Crashed`** (`project-spec.md` §4.2) — this is a double-failure case (both the engine and FastAPI went down around the same time) that would otherwise leave a phantom `Running` row until someone happens to run the engine again. FastAPI can distinguish the two cases on its own startup by attempting a **non-blocking `flock` on the same lock file as a liveness probe** — if it succeeds (nothing holds the lock), no engine process actually owns that `Running` row, and FastAPI should immediately release the probe lock and mark the row `Crashed` itself, rather than waiting for a future engine invocation to notice.
+
 ---
 
 ## 6. Database Schema & API Specifications
 
 ### 6.1 SQLite Schema
 
-The schema below reflects what's actually implemented in `phase1-organize.py`, not a set of `ALTER TABLE` additions on top of the original `photos` table. Error tracking, name-collision flags, and original filenames live in a dedicated **audit log table** rather than as columns bolted onto `photos` — see the design note below for why.
+The schema below reflects what's actually implemented in `lenslogic_engine.py`, not a set of `ALTER TABLE` additions on top of the original `photos` table. Error tracking, name-collision flags, and original filenames live in a dedicated **audit log table** rather than as columns bolted onto `photos` — see the design note below for why.
 
 ```sql
 -- photos: CURRENT STATE only, one row per source_path (UNIQUE constraint
@@ -348,15 +376,35 @@ Updates global engine settings.
 
 POST /api/v1/jobs/start
 
-Starts an engine execution job, automatically injecting active configuration parameters from /settings if not explicitly overridden.
+Starts an engine execution job, automatically injecting active configuration parameters from /settings if not explicitly overridden. `file_ids` and `source_subdir` are mutually exclusive — provide one or neither (a full directory scan), never both. Returns `409 Conflict` if another job is already running (§5.5) instead of spawning a doomed subprocess.
 
-    Body:
+    Body (individual selection):
     JSON
 
     {
       "mode": "move",
       "file_ids": [101, 102, 105]
     }
+
+    Body (folder selection):
+    JSON
+
+    {
+      "mode": "move",
+      "source_subdir": "sd_card/day1"
+    }
+
+    409 Response (another job already active):
+    JSON
+
+    {
+      "error": "job_already_running",
+      "active_run": { "id": 47, "mode": "MOVE", "started_at": "2026-02-14T10:28:03Z" }
+    }
+
+GET /api/v1/runs/{run_id}/operations
+
+Returns the full `operations` history for a run (`SELECT * FROM operations WHERE run_id = ? ORDER BY timestamp`). Used for the reconnect replay in §4.1/§5.2 — always called before subscribing to a run's live WebSocket stream, not just after a detected disconnect, so the log is complete regardless of when the client first connected.
 
 POST /api/v1/jobs/{id}/cancel
 

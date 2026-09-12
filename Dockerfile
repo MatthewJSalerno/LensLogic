@@ -18,10 +18,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application script and entrypoint
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
-COPY phase1-organize.py .
+COPY lenslogic_engine.py .
 
 # Pre-create standard volume mount points
 RUN mkdir -p /data/source /data/dest /appdata/db /appdata/logs
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["python3", "phase1-organize.py"]
+CMD ["python3", "lenslogic_engine.py"]
