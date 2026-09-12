@@ -1,5 +1,5 @@
 """
-Project: LensLogic (Phase 1: Core Engine)
+Project: NegativeSpace (Phase 1: Core Engine)
 Description: A backend engine for organizing large photo collections based on spec.
 
 Runtime Arguments:
@@ -224,7 +224,7 @@ def configure_logging(log_dir: Path):
     )
 
 
-logger = logging.getLogger("LensLogic")
+logger = logging.getLogger("NegativeSpace")
 
 # --- Cancellation Support ---
 # Set by a SIGTERM/SIGINT handler registered in main(). Checked between
@@ -943,7 +943,7 @@ def parse_file_ids(value: str) -> List[int]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="LensLogic - Photo Collection Organizer (Phase 1 Engine)")
+    parser = argparse.ArgumentParser(description="NegativeSpace - Photo Collection Organizer (Phase 1 Engine)")
     parser.add_argument("--source", default="/data/source", help="Path to source directory (default: /data/source).")
     parser.add_argument("--dest", default="/data/dest", help="Path to destination directory (default: /data/dest).")
     parser.add_argument("--base", default="/appdata", help="Base directory for DB and logs (default: /appdata).")
@@ -998,7 +998,7 @@ def main():
     lock_fd = acquire_single_instance_lock(base_dir)
     if lock_fd is None:
         logger.error(
-            f"FATAL: another LensLogic engine process is already running against --base {base_dir} "
+            f"FATAL: another NegativeSpace engine process is already running against --base {base_dir} "
             f"(lock file: {base_dir / LOCK_FILENAME}). Only one operation may run at a time. "
             f"Wait for it to finish, or cancel it, then retry."
         )
@@ -1014,7 +1014,7 @@ def main():
         if not EXIFTOOL_BINARY_AVAILABLE:
             missing.append("the 'exiftool' system binary (apt install libimage-exiftool-perl)")
         logger.error(
-            "FATAL: ExifTool is a hard requirement for LensLogic and is not available. "
+            "FATAL: ExifTool is a hard requirement for NegativeSpace and is not available. "
             f"Missing: {' and '.join(missing)}."
         )
         sys.exit(1)
@@ -1028,7 +1028,7 @@ def main():
         return
 
     mode_label = "COPY" if args.copy else ("MOVE" if args.move else "INDEX")
-    logger.info(f"Initializing LensLogic Engine. Mode: {mode_label}")
+    logger.info(f"Initializing NegativeSpace Engine. Mode: {mode_label}")
     logger.info(f"Base Directory: {base_dir}")
     logger.info(f"Source Directory: {source_path}")
     logger.info(f"Destination Directory: {dest_path}")
