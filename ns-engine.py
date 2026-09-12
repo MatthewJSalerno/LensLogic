@@ -237,12 +237,25 @@ result_queue = queue.Queue(maxsize=DB_QUEUE_SIZE)
 
 # --- Logging Initialization ---
 def configure_logging(log_dir: Path):
-    """Configures logging to output to console and base/logs/organizer.log."""
+    """
+    Points logging at the console and <base>/logs/organizer.log.
+
+    Called in the main process AND once per worker process (via
+    _init_worker_process), because worker log records must not depend on
+    inheriting the parent's handlers across a fork — see that function for
+    why. basicConfig() is a no-op when the root logger already has handlers,
+    so the fork case keeps exactly what it inherited and only a genuinely
+    unconfigured process (spawn/forkserver) sets up its own.
+
+    The process id is in the format for the same reason: worker records
+    otherwise all claim to be "MainThread" and there is no way to tell which
+    process emitted which line.
+    """
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "organizer.log"
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] (%(threadName)s) %(message)s',
+        format='%(asctime)s [%(levelname)s] (pid:%(process)d/%(threadName)s) %(message)s',
         handlers=[
             logging.StreamHandler(sys.stdout),
             logging.FileHandler(log_file, mode="a", encoding="utf-8")
@@ -626,11 +639,32 @@ def reconcile_interrupted_state(db_path: Path):
 
 
 # --- Pre-Flight Space Validation ---
+def _nearest_existing_dir(path: Path) -> Path:
+    """
+    Walks up until it finds a directory that actually exists. Used to ask the
+    filesystem about free space on the volume a not-yet-created path will
+    land on, without creating anything to find out.
+    """
+    for candidate in (path, *path.parents):
+        if candidate.is_dir():
+            return candidate
+    return Path(path.anchor or '.')
+
+
 def verify_sufficient_disk_space(dest_path: Path, required_bytes: int, safety_margin_mb: int = 500) -> bool:
-    """Checks if the destination directory volume has sufficient space available."""
-    check_dir = dest_path if dest_path.exists() else dest_path.parent
-    check_dir.mkdir(parents=True, exist_ok=True)
-    stat = shutil.disk_usage(check_dir)
+    """
+    Checks whether the destination volume has room for `required_bytes`.
+
+    Strictly read-only: this used to mkdir(parents=True) the destination as a
+    side effect of "verifying", so merely asking the question left directory
+    trees behind — including on a run that then aborted for insufficient
+    space, or a --copy against a source that turned out to be empty. Free
+    space is a property of the VOLUME, so querying the nearest existing
+    ancestor answers the same question without writing anything. The real
+    destination directories are created when a file is actually written
+    (copy_verify_delete).
+    """
+    stat = shutil.disk_usage(_nearest_existing_dir(dest_path))
     buffer_bytes = safety_margin_mb * 1024 * 1024
     total_needed = required_bytes + buffer_bytes
 
@@ -667,14 +701,27 @@ def parse_exif_date(value: str) -> Optional[datetime]:
 _worker_exiftool: Optional["pyexiftool.ExifToolHelper"] = None
 
 
-def _init_worker_process(exiftool_supported: bool):
+def _init_worker_process(exiftool_supported: bool, log_dir: Optional[str] = None):
     """
     ProcessPoolExecutor initializer — runs once when each worker process
-    starts, before it's given any files. Sets up this worker's persistent
-    ExifTool instance (if ExifTool is available) and registers cleanup so
-    the subprocess doesn't outlive its parent worker.
+    starts, before it's given any files. Sets up this worker's logging and
+    its persistent ExifTool instance, and registers cleanup so the ExifTool
+    subprocess doesn't outlive its parent worker.
+
+    Logging is configured explicitly here rather than relying on the worker
+    inheriting the parent's handlers, because that inheritance only happens
+    under the `fork` start method. Verified directly: a forked worker sees
+    the parent's handlers and its records reach organizer.log, but a spawned
+    worker has ZERO handlers, so every logger call falls through to
+    logging.lastResort — printed bare to stderr, never written to the log
+    file at all. That is the default on macOS (since 3.8) and Windows, and
+    CPython is moving Linux off plain `fork` as well, so worker-side
+    diagnostics would silently disappear from the log exactly where they are
+    hardest to reproduce.
     """
     global _worker_exiftool
+    if log_dir:
+        configure_logging(Path(log_dir))
     if not exiftool_supported:
         return
     try:
@@ -1166,6 +1213,51 @@ def release_single_instance_lock(lock_fd):
 
 
 # --- Main Execution ---
+def is_hidden_path(path: Path, root: Path) -> bool:
+    """
+    True if any path segment below `root` starts with a dot.
+
+    Checking every segment, not just the filename, is what makes this cover
+    whole junk trees (.Trashes/, .Spotlight-V100/, .thumbnails/) and not just
+    individual dotfiles.
+
+    The case that actually motivated this: macOS writes an AppleDouble
+    sidecar named "._IMG_0001.jpg" beside every real file on non-HFS volumes
+    (SD cards, USB drives, network shares). Those carry a real photo
+    extension, so the scan happily indexed each one as a photograph —
+    hashing it, failing to find EXIF, filing it by mtime, and on --move
+    dutifully migrating a few KB of resource-fork metadata into the library
+    as if it were a picture. Every SD card import brought a shadow copy of
+    itself. .DS_Store never matched an extension so it was harmless; these
+    were not.
+    """
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        relative = Path(path.name)
+    return any(part.startswith('.') for part in relative.parts)
+
+
+def normalize_extensions(raw: str) -> set:
+    """
+    Parses --exts into the form Path.suffix actually produces.
+
+    Path.suffix ALWAYS includes the leading dot (".jpg"), and the scan
+    compares against it directly — so a user passing the perfectly reasonable
+    `--exts jpg,png` previously matched nothing at all and the run reported
+    "Discovered 0 files" with no hint why. Both spellings are now accepted,
+    along with surrounding whitespace and any casing:
+        ".jpg, PNG , .HEIC"  ->  {".jpg", ".png", ".heic"}
+    """
+    extensions = set()
+    for item in raw.split(','):
+        item = item.strip().lower()
+        if not item:
+            continue
+        extensions.add(item if item.startswith('.') else f".{item}")
+    return extensions
+
+
 def parse_file_ids(value: str) -> List[int]:
     try:
         return [int(x.strip()) for x in value.split(',') if x.strip()]
@@ -1240,9 +1332,7 @@ def main():
     args = parser.parse_args()
 
     worker_count = args.workers if args.workers else MAX_WORKER_PROCESSES
-    active_extensions = (
-        {e.strip().lower() for e in args.exts.split(',') if e.strip()} if args.exts else SUPPORTED_EXTENSIONS
-    )
+    active_extensions = normalize_extensions(args.exts) if args.exts else SUPPORTED_EXTENSIONS
 
     # 1. Resolve Base Path & Setup Subdirectories
     base_dir = Path(args.base).resolve()
@@ -1375,9 +1465,14 @@ def main():
         else:
             files_to_process = [
                 str(p) for p in source_path.rglob('*')
-                if p.is_file() and not p.is_symlink() and p.suffix.lower() in active_extensions
+                if p.is_file() and not p.is_symlink()
+                and p.suffix.lower() in active_extensions
+                and not is_hidden_path(p, source_path)
             ]
-            logger.info(f"Discovered {len(files_to_process)} supported photo/image files to scan.")
+            logger.info(
+                f"Discovered {len(files_to_process)} supported photo/image files to scan "
+                f"(extensions: {', '.join(sorted(active_extensions))})."
+            )
 
         # Submitted in bounded batches rather than all at once. Every
         # completed future holds its ProcessingResult — including the FULL
@@ -1393,7 +1488,7 @@ def main():
         with ProcessPoolExecutor(
             max_workers=worker_count,
             initializer=_init_worker_process,
-            initargs=(EXIFTOOL_SUPPORTED,)
+            initargs=(EXIFTOOL_SUPPORTED, str(log_dir))
         ) as executor:
             for batch_start in range(0, len(files_to_process), scan_batch_size):
                 if cancel_requested.is_set():
