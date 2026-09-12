@@ -1,4 +1,4 @@
-# LensLogic
+# NegativeSpace
 
 A backend engine for organizing large photo collections based on EXIF metadata, hash verification, and transactional file moves.
 
@@ -7,12 +7,12 @@ A backend engine for organizing large photo collections based on EXIF metadata, 
 ### Build
 
 ```bash
-docker build -t lenslogic .
+docker build -t negativespace .
 ```
 
 ### Operations Summary
 
-LensLogic has three mutually exclusive modes. `--move` and `--copy` cannot be combined — pick at most one:
+NegativeSpace has three mutually exclusive modes. `--move` and `--copy` cannot be combined — pick at most one:
 
 | Mode | Flag | Source files | Destination |
 | --- | --- | --- | --- |
@@ -30,7 +30,7 @@ docker run --rm \
   -v /path/to/your/photos:/data/source:ro \
   -v /path/to/organized:/data/dest \
   -v /path/to/appdata:/appdata \
-  lenslogic
+  negativespace
 ```
 
 ### Run (Move — Copy-Verify-Delete)
@@ -43,7 +43,7 @@ docker run --rm \
   -v /path/to/your/photos:/data/source \
   -v /path/to/organized:/data/dest \
   -v /path/to/appdata:/appdata \
-  lenslogic python3 lenslogic_engine.py --move
+  negativespace python3 ns-engine.py --move
 ```
 
 ### Run (Copy — Non-Destructive)
@@ -56,7 +56,7 @@ docker run --rm \
   -v /path/to/your/photos:/data/source:ro \
   -v /path/to/organized:/data/dest \
   -v /path/to/appdata:/appdata \
-  lenslogic python3 lenslogic_engine.py --copy
+  negativespace python3 ns-engine.py --copy
 ```
 
 > **Note:** `--move` against a read-only-mounted source will not corrupt anything, but every file will report `status='Failed'` (the copy succeeds; only the source deletion fails) and repeated attempts will accumulate orphaned duplicate copies at the destination. Use `--copy` for read-only sources instead.
@@ -71,6 +71,6 @@ docker run --rm \
   - `/data/dest`: Structured target directory organized by `YYYY/MM/DD` format.
   - `/appdata`: Dedicated application directory storing persistent data inside `/appdata/db` and log files inside `/appdata/logs`.
 - **Persistence:** SQLite database (`photo_hashes.db`) stores SHA1 checksums, perceptual hashes, and status to prevent re-processing across multiple runs.
-- **Date & Metadata Resolution:** ExifTool is a **hard requirement** — the engine won't start without it (both the `exiftool` binary and the `PyExifTool` Python package). It runs as a persistent process per worker rather than spawning a subprocess per file, cutting ExifTool overhead roughly 30x. PIL and file-modification-time remain as defensive per-file fallbacks for the rare case ExifTool itself fails on one specific file — see `lenslogic_engine.py`'s module docstring for the full breakdown.
+- **Date & Metadata Resolution:** ExifTool is a **hard requirement** — the engine won't start without it (both the `exiftool` binary and the `PyExifTool` Python package). It runs as a persistent process per worker rather than spawning a subprocess per file, cutting ExifTool overhead roughly 30x. PIL and file-modification-time remain as defensive per-file fallbacks for the rare case ExifTool itself fails on one specific file — see `ns-engine.py`'s module docstring for the full breakdown.
 - **Single-Instance Lock:** Only one engine process may run against a given `--base` (i.e., a given `/appdata` mount) at a time — enforced via an OS-level `flock` on `/appdata/engine.lock`. This is released automatically by the kernel on any exit, including a `docker stop` that times out into `SIGKILL` — no manual deletion of the lock file is ever needed, even after a force-stopped container. **NFS caveat:** `flock` reliability is weaker over NFS depending on the server/client's `lockd`/`statd` setup — fine for local disk or a standard Docker volume backing `/appdata`, but worth a second look if that mount is ever NFS-backed instead.
 - **Supported Formats:** `.jpg`, `.jpeg`, `.png`, `.heic`, `.tiff`, `.raw`, `.dng`, `.cr2`, `.nef`, `.arw`, `.raf`.

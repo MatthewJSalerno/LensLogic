@@ -1,4 +1,4 @@
-# Functional & Technical Design Specification: LensLogic Phase 3 — Fuzzy Matching & EXIF Editing
+# Functional & Technical Design Specification: NegativeSpace Phase 3 — Fuzzy Matching & EXIF Editing
 
 ## 1. Scope
 
@@ -24,5 +24,5 @@ These weren't resolved in the original draft and need scoping before implementat
 ## 4. Dependencies on Phase 1/2
 
 * Requires the `phash` values Phase 1 already computes — no new hashing work needed, just new logic that reads and compares existing values.
-* Likely requires a new backend endpoint (e.g. `GET /api/v1/photos/similar/{id}?threshold=N`) computing Hamming distance across the `photos` table's `phash` column — this is a Node.js/API-layer concern, not a `lenslogic_engine.py` engine change, unless clustering needs to happen at index time rather than on-demand.
+* Likely requires a new backend endpoint (e.g. `GET /api/v1/photos/similar/{id}?threshold=N`) computing Hamming distance across the `photos` table's `phash` column — this is a Node.js/API-layer concern, not a `ns-engine.py` engine change, unless clustering needs to happen at index time rather than on-demand.
 * The Inspector panel (Phase 2 §4.2) already displays a file's own pHash — Phase 3 extends that panel with the similarity group/percentage data once clustering exists.

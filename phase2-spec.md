@@ -1,8 +1,8 @@
-# Functional & Technical Design Specification: LensLogic Web Interface
+# Functional & Technical Design Specification: NegativeSpace Web Interface
 
 ## 1. System Overview & Architecture
 
-The LensLogic Web Interface provides a modern web UI for the containerized Python Phase 1 engine (`lenslogic_engine.py`). It transforms the CLI engine into an interactive application supporting real-time operation monitoring, selective file processing, context-aware duplicate resolution, detailed metadata inspection, dedicated runtime settings management, extension validation, and audit logging.
+The NegativeSpace Web Interface provides a modern web UI for the containerized Python Phase 1 engine (`ns-engine.py`). It transforms the CLI engine into an interactive application supporting real-time operation monitoring, selective file processing, context-aware duplicate resolution, detailed metadata inspection, dedicated runtime settings management, extension validation, and audit logging.
 
 ```
 +-----------------------------------------------------------------------------------+
@@ -17,7 +17,7 @@ The LensLogic Web Interface provides a modern web UI for the containerized Pytho
 | SQLite (WAL) / Subprocess
 +-----------------------------------------------------------------------------------+
 |                             Phase 1 Engine Core                                   |
-|   (lenslogic_engine.py --workers N --exts ex1,ex2 --file-ids id1,id2               |
+|   (ns-engine.py --workers N --exts ex1,ex2 --file-ids id1,id2               |
 |                        --source-subdir path)                                      |
 +-----------------------------------------------------------------------------------+
 ```
@@ -33,7 +33,7 @@ The LensLogic Web Interface provides a modern web UI for the containerized Pytho
 1. User triggers an Index scan (full directory or, on a repeat visit,
    just a "Rescan" to pick up newly added files).
    -> FastAPI checks for an already-active job (409 if one exists, §5.5)
-   -> FastAPI spawns: python3 lenslogic_engine.py
+   -> FastAPI spawns: python3 ns-engine.py
    -> Engine scans the full source directory, hashes everything, flags
       duplicates, captures metadata, and populates SQLite.
 
@@ -48,8 +48,8 @@ The LensLogic Web Interface provides a modern web UI for the containerized Pytho
 
 5. FastAPI re-checks for an active job (409 if one exists), then spawns
    the engine, scoped one of two ways:
-   python3 lenslogic_engine.py --move --file-ids 101,102,105  (or --copy)
-   python3 lenslogic_engine.py --move --source-subdir sd_card/day1
+   python3 ns-engine.py --move --file-ids 101,102,105  (or --copy)
+   python3 ns-engine.py --move --source-subdir sd_card/day1
 
 6. Job progress streams back to the frontend via WebSocket, reusing the
    engine's own status transitions (Pending -> Processing ->
@@ -226,7 +226,7 @@ If operations fail, an Error Banner highlights the failures, sourced directly fr
 |    Source: /data/source/sd_card/IMG_1050.JPG                                     |
 |    Error:  Source file changed: no longer found at /data/source/sd_card/         |
 |            IMG_1050.JPG. It may have been moved, renamed, or deleted outside      |
-|            LensLogic since the last Index.                                       |
+|            NegativeSpace since the last Index.                                       |
 +-----------------------------------------------------------------------------------+
 ```
 
@@ -256,7 +256,7 @@ Only one engine process may run at a time — see `project-spec.md` §4.1/§7 fo
 
 ### 6.1 SQLite Schema
 
-The schema below reflects what's actually implemented in `lenslogic_engine.py`, not a set of `ALTER TABLE` additions on top of the original `photos` table. Error tracking, name-collision flags, and original filenames live in a dedicated **audit log table** rather than as columns bolted onto `photos` — see the design note below for why.
+The schema below reflects what's actually implemented in `ns-engine.py`, not a set of `ALTER TABLE` additions on top of the original `photos` table. Error tracking, name-collision flags, and original filenames live in a dedicated **audit log table** rather than as columns bolted onto `photos` — see the design note below for why.
 
 ```sql
 -- photos: CURRENT STATE only, one row per source_path (UNIQUE constraint

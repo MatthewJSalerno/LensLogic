@@ -1,4 +1,4 @@
-# Project Design Specification: LensLogic
+# Project Design Specification: NegativeSpace
 
 ## 1. Project Overview
 **Objective:** A web-based application designed to automate the organization of large, complex photo collections.
@@ -33,7 +33,7 @@ To balance heavy-duty data processing with a high-quality user experience, the a
 *   **Function:** Handles HTTP/WebSocket requests, spawns the Python engine as a child process (passing `--file-ids` for selection-scoped operations), reads the SQLite database to report progress, and relays real-time updates to the frontend. This is the only layer that talks to both the Python engine and the database directly — the frontend talks only to this layer.
 *   **Communication:** WebSockets for real-time updates during long-running tasks; sends `SIGTERM` to the engine subprocess for graceful cancellation.
 
-### 3.3. The Processing Engine (Python) — Implemented (`lenslogic_engine.py`)
+### 3.3. The Processing Engine (Python) — Implemented (`ns-engine.py`)
 *   **Role:** The "Workhorse" for data heavy-lifting. Runs as a standalone CLI process today; Phase 2's API layer invokes it as a child process rather than replacing it.
 *   **Function:** Handles filesystem crawling (or targeted ID lookup), EXIF/full-metadata extraction, SHA1/pHash generation, and physical file manipulation.
 *   **Concurrency:**
@@ -89,7 +89,7 @@ To balance heavy-duty data processing with a high-quality user experience, the a
     *   **Crash Recovery — run level:** On startup, any `runs` row still marked `Running` (meaning that process was killed uncatchably — `SIGKILL`, OOM-kill, power loss — bypassing the normal shutdown path) is marked `Crashed` with a real end timestamp, rather than being left showing as perpetually in-progress forever.
     *   **Re-scan safety:** Re-running the engine against a source directory that still contains previously-cataloged files (the normal Index → review → `--move` workflow) updates existing database rows in place (`INSERT ... ON CONFLICT(source_path) DO UPDATE`) rather than failing on a duplicate-key error.
     *   **Cancellation:** Checked between files, never mid-file — the in-flight file always finishes its Copy-Verify(-Delete) before the loop stops. Every remaining targeted file that never got a chance to run is logged to `operations` with `status = 'Cancelled'`, while its `photos.status` stays `Pending` (not overwritten), so a plain re-run picks it back up naturally. Duplicate-source cleanup is skipped entirely for a cancelled run, since it depends on knowing the final fate of every targeted `Pending` file first.
-    *   **Source file changed since Index:** If a targeted file's `source_path` no longer exists on disk when the engine actually tries to process it (moved, renamed, or deleted outside LensLogic since the last Index — most likely with `--file-ids`/`--source-subdir` targeting a stale selection), this is detected explicitly *before* attempting to open the file, rather than surfacing as a raw `FileNotFoundError` traceback. Recorded as `status = 'Failed'` with a specific, human-readable `error_message`: `"Source file changed: no longer found at <path>. It may have been moved, renamed, or deleted outside LensLogic since the last Index."` The distinct wording matters for the Error Center (`phase2-spec.md` §5.3) — a user seeing this should understand to re-index, not assume a permissions or disk problem.
+    *   **Source file changed since Index:** If a targeted file's `source_path` no longer exists on disk when the engine actually tries to process it (moved, renamed, or deleted outside NegativeSpace since the last Index — most likely with `--file-ids`/`--source-subdir` targeting a stale selection), this is detected explicitly *before* attempting to open the file, rather than surfacing as a raw `FileNotFoundError` traceback. Recorded as `status = 'Failed'` with a specific, human-readable `error_message`: `"Source file changed: no longer found at <path>. It may have been moved, renamed, or deleted outside NegativeSpace since the last Index."` The distinct wording matters for the Error Center (`phase2-spec.md` §5.3) — a user seeing this should understand to re-index, not assume a permissions or disk problem.
     *   **ExifTool startup check:** Before touching the database or source/dest paths at all, the engine verifies both the `exiftool` binary and the `PyExifTool` package are available and exits immediately with a clear fatal error if either is missing (§3.3) — tested directly (binary hidden from `PATH`) and confirmed it fails cleanly with no directories or database files created.
 
 ### 4.3. Reporting & Feedback

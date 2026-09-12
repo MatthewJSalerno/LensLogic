@@ -18,11 +18,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application script and entrypoint
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
-COPY lenslogic_engine.py .
-RUN chmod 644 lenslogic_engine.py
+COPY ns-engine.py .
+RUN chmod 644 ns-engine.py
 
 # Pre-create standard volume mount points
 RUN mkdir -p /data/source /data/dest /appdata/db /appdata/logs
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["python3", "lenslogic_engine.py"]
+CMD ["python3", "ns-engine.py"]
