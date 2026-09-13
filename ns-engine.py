@@ -174,6 +174,14 @@ LOCK_FILENAME = "engine.lock"
 # a real 'Completed' audit state with a spurious 'Failed'.
 SOURCE_CONSUMED_STATUSES = ('Completed', 'Removed_Duplicate')
 
+# Recorded in each photo's metadata_json as "date_source", so it is always
+# answerable after the fact where a file's date — and therefore its YYYY/MM/DD
+# folder — actually came from. EXIF timestamps carry no timezone and are used
+# exactly as the camera wrote them; a filesystem mtime is interpreted in the
+# container's timezone, so only DATE_SOURCE_MTIME files are affected by TZ.
+DATE_SOURCE_EXIF = "exif"
+DATE_SOURCE_MTIME = "file_mtime"
+
 # Bumped whenever the on-disk schema or the MEANING of a stored value changes.
 # CREATE TABLE IF NOT EXISTS cannot alter an existing table, so anything beyond
 # adding a brand-new table needs a migration step in _migrate_schema().
@@ -572,6 +580,7 @@ def db_writer_worker(db_path: str):
 
     pending_writes = 0
     last_flush = time.monotonic()
+    date_sources = {DATE_SOURCE_EXIF: 0, DATE_SOURCE_MTIME: 0}
 
     def flush():
         nonlocal pending_writes, last_flush
@@ -670,6 +679,10 @@ def db_writer_worker(db_path: str):
                 conn, result.run_id, photo_id, result.file_path, result.dest_path, status,
                 result.error_message, result.has_name_collision, commit=False
             )
+            source = result.metadata.get("date_source") if result.metadata else None
+            if source in date_sources:
+                date_sources[source] += 1
+
             pending_writes += 1
             if pending_writes >= DB_COMMIT_BATCH_SIZE or (
                 time.monotonic() - last_flush >= DB_COMMIT_INTERVAL_SECONDS
@@ -684,6 +697,23 @@ def db_writer_worker(db_path: str):
         flush()
     except Exception as e:
         logger.error(f"DB writer failed to flush its final batch: {e}")
+
+    # Where each file's date came from, and therefore which files the
+    # container's timezone actually affected. EXIF timestamps carry no zone and
+    # are used as the camera wrote them; an mtime is interpreted in local time,
+    # so a photo modified late in the evening can land in the next day's folder
+    # under a different TZ. Surfacing the count makes that visible per run
+    # instead of being something you discover in the organized tree later.
+    from_exif = date_sources[DATE_SOURCE_EXIF]
+    from_mtime = date_sources[DATE_SOURCE_MTIME]
+    if from_exif or from_mtime:
+        logger.info(f"Date sources: {from_exif} from EXIF, {from_mtime} from file modification time.")
+    if from_mtime:
+        logger.warning(
+            f"{from_mtime} file(s) had no usable EXIF date and were filed by modification time. "
+            f"Those dates are interpreted in this container's timezone (logged above) — "
+            f"pass -e TZ=<zone> if the folders look a day off."
+        )
     conn.close()
     logger.info("Database worker thread shut down cleanly.")
 
@@ -965,27 +995,30 @@ def get_metadata_and_date(file_path: Path) -> tuple:
     already self-heals from that in get_full_exif_via_exiftool(); this is
     the next layer down if a file just doesn't yield usable metadata at all.
     """
+    def _mtime_fallback(meta: dict) -> tuple:
+        meta["date_source"] = DATE_SOURCE_MTIME
+        return datetime.fromtimestamp(os.path.getmtime(file_path)), meta
+
     metadata = get_full_exif_via_exiftool(file_path)
     if metadata:
         dt = extract_date_from_metadata(metadata)
         if dt:
+            metadata["date_source"] = DATE_SOURCE_EXIF
             return dt, metadata
         # ExifTool ran but found no usable date tag — still keep whatever
         # metadata it did find, just fall through for the date itself.
-        fallback_dt = datetime.fromtimestamp(os.path.getmtime(file_path))
-        return fallback_dt, metadata
+        return _mtime_fallback(metadata)
 
     metadata = get_exif_via_pil(file_path)
     if metadata:
         dt = extract_date_from_metadata(metadata)
         if dt:
+            metadata["date_source"] = DATE_SOURCE_EXIF
             return dt, metadata
-        fallback_dt = datetime.fromtimestamp(os.path.getmtime(file_path))
-        return fallback_dt, metadata
+        return _mtime_fallback(metadata)
 
     # Neither source found anything at all.
-    fallback_dt = datetime.fromtimestamp(os.path.getmtime(file_path))
-    return fallback_dt, {}
+    return _mtime_fallback({})
 
 
 def compute_sha1(file_path: str) -> str:
