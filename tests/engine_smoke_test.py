@@ -30,6 +30,7 @@ Exit code is non-zero if any test fails.
 """
 
 import argparse
+import json
 import os
 import shutil
 import signal
@@ -69,7 +70,21 @@ def run_engine(case, *args, expect_rc=0, timeout=300):
            "--source", str(case / "src"),
            "--dest", str(case / "dest"),
            "--base", str(case / "appdata")] + [str(a) for a in args]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        # Surface what the engine managed to print before it stalled. Without
+        # this a hang reports only the command line — which is what happened in
+        # CI, leaving a 300-second timeout with nothing to diagnose it from.
+        # The last lines before the stall say which phase it died in.
+        raw = e.stdout or b""
+        partial = raw if isinstance(raw, str) else raw.decode("utf-8", "replace")
+        tail = "\n".join(f"      | {l}" for l in partial.splitlines()[-25:])
+        raise Fail(
+            f"engine did not finish within {timeout}s — a HANG, not a slow run.\n"
+            f"    args: {' '.join(str(a) for a in args) or '(index)'}\n"
+            f"    last output before it stalled:\n{tail or '      | (nothing captured)'}"
+        )
     if VERBOSE:
         print("\n".join("      | " + l for l in proc.stdout.splitlines()))
     if expect_rc is not None and proc.returncode != expect_rc:
@@ -253,6 +268,21 @@ def exact_duplicate_removed_only_with_verified_copy():
     check("Removed_Duplicate" in final.values(), f"duplicate not cleaned up: {final}")
     check(len(dest_files(case)) == 1, f"only one physical copy should remain: {dest_files(case)}")
     check(src_files(case) == [], f"source should be empty, left {src_files(case)}")
+
+    # Every row — the surviving copy AND each duplicate — must point at a file
+    # that actually exists. A duplicate keeps the destination projected for it
+    # at Index time under its own filename, which is never written; left
+    # uncorrected the record describes a phantom, which is useless exactly when
+    # it matters: "this was a duplicate, so where did its content end up?"
+    for r in rows(case, "SELECT source_path, status, dest_path FROM photos"):
+        check(r["dest_path"] and Path(r["dest_path"]).exists(),
+              f"{Path(r['source_path']).name} ({r['status']}) points at a file that does not "
+              f"exist: {r['dest_path']}")
+
+    # ...and every member of the group is reachable from its sha1.
+    group = rows(case, "SELECT sha1_hash, COUNT(*) n FROM photos GROUP BY sha1_hash")
+    check(len(group) == 1 and group[0]["n"] == 2,
+          f"both copies should share one sha1 group, got {group}")
 
 
 @test
@@ -553,6 +583,42 @@ def real_raw_files_decode_when_supplied():
         check(r["status"] == "Pending", f"{name}: expected Pending, got {r['status']}")
         check(r["metadata_json"] and "date_taken" in r["metadata_json"],
               f"{name}: no metadata captured from the RAW file")
+
+
+@test
+def date_source_records_where_the_date_came_from():
+    """
+    Every photo records whether its date came from EXIF or the file's mtime.
+
+    This is the difference between a date that is timezone-proof and one that
+    is not: EXIF timestamps carry no zone and are used exactly as the camera
+    wrote them, while an mtime is interpreted in the container's timezone — so
+    a file modified late in the evening can land in the next day's folder under
+    a different TZ. Recording the source per photo is what lets the count be
+    reported per run, and what the Phase 2 inspector reads to tell a user their
+    date came from the filesystem rather than the camera.
+    """
+    case = new_case("datesource")
+    make_photo(case / "src" / "with_exif.jpg", "e", date="2019:07:04 21:30:00")
+    make_photo(case / "src" / "no_exif.jpg", "n", date=None)
+
+    run_engine(case)
+
+    found = {}
+    for r in rows(case, "SELECT source_path, metadata_json, dest_path FROM photos"):
+        found[Path(r["source_path"]).name] = (
+            json.loads(r["metadata_json"]).get("date_source"), r["dest_path"]
+        )
+
+    check(found.get("with_exif.jpg", (None,))[0] == "exif",
+          f"EXIF-dated photo should record date_source 'exif', got {found.get('with_exif.jpg')}")
+    check(found.get("no_exif.jpg", (None,))[0] == "file_mtime",
+          f"photo without an EXIF date should record 'file_mtime', got {found.get('no_exif.jpg')}")
+
+    # The EXIF date is used verbatim, so its folder is fixed regardless of
+    # the timezone this runs under.
+    check("2019/07/04" in found["with_exif.jpg"][1],
+          f"EXIF date should bucket to 2019/07/04 in any timezone, got {found['with_exif.jpg'][1]}")
 
 
 @test

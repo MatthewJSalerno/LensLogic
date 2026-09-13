@@ -1,9 +1,13 @@
 FROM python:3.11-slim
 
-# Install system dependencies (ExifTool, gosu, and build essentials for pillow-heif)
+# Install system dependencies (ExifTool, gosu, tzdata, and build essentials for
+# pillow-heif). tzdata is required for -e TZ=<zone> to have any effect: without
+# the zoneinfo database the variable is silently ignored and the container stays
+# on UTC, which quietly changes which YYYY/MM/DD folder a photo lands in.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     exiftool \
     gosu \
+    tzdata \
     build-essential \
     libheif-dev \
     pkg-config \

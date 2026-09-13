@@ -36,7 +36,7 @@ The flags are deliberately **not** hidden (no `argparse.SUPPRESS`), and the engi
 ```
 1. User triggers an Index scan (full directory or, on a repeat visit,
    just a "Rescan" to pick up newly added files).
-   -> FastAPI checks for an already-active job (409 if one exists, §5.6)
+   -> FastAPI checks for an already-active job (409 if one exists, §5.7)
    -> FastAPI spawns: python3 ns-engine.py
    -> Engine scans the full source directory, hashes everything, flags
       duplicates, captures metadata, and populates SQLite.
@@ -243,7 +243,41 @@ A searchable table logging every operation performed by the engine:
 * **Columns:** Timestamp, Mode (`MOVE`/`COPY`), Source Path, Destination Path, Status (`Completed`, `Copied`, `Removed_Duplicate`, `Failed`), and System Error Message.
 * **Controls:** Filter by date, status, or free-text search; CSV/JSON export.
 
-### 5.5 Engine Invocation as a Trust Boundary
+### 5.5 Job Outcome Is Derived, Not Read From `runs.status`
+
+**`runs.status` describes the run's lifecycle, not whether the work succeeded.** A run that reaches the end of its file loop is recorded `Completed` even if every single file in it failed. That is accurate for what the column means — the process ran to completion rather than crashing, being cancelled, or aborting on a pre-flight check — but it is the wrong thing to put in front of a user on its own.
+
+Observed in practice: a `--move` against a source mounted `:ro` fails every file (the copy succeeds, only the source deletion fails) and still reports:
+
+```
+Run #2 finished with status: Completed
+```
+
+Surfacing that verbatim would show a green **Completed** for a job where nothing succeeded, and the user would have to open the Error Center to discover their entire operation did nothing.
+
+**The API therefore derives a job outcome from the `operations` rows rather than echoing `runs.status`:**
+
+```sql
+SELECT status, COUNT(*) FROM operations WHERE run_id = ? GROUP BY status;
+```
+
+The per-file truth is already recorded there — `Completed`, `Copied`, `Failed`, `Cancelled`, `Removed_Duplicate`, each with an `error_message` where applicable — so no engine change and no new status vocabulary is required. `runs.status` keeps its current meaning and remains the right thing to check for "is a job still running" (§5.7) and for crash reconciliation.
+
+Job responses should carry both: the lifecycle status **and** the derived counts, so the UI can render *"Move finished — 0 of 23 succeeded, 23 failed"* rather than a bare word. Recommended presentation rules:
+
+| condition | display |
+|---|---|
+| `runs.status` is `Running` | in progress, with live counts |
+| succeeded > 0, failed = 0 | success |
+| succeeded > 0, failed > 0 | partial success — surface the failed count and link the Error Center |
+| succeeded = 0, failed > 0 | **failure**, regardless of `runs.status` being `Completed` |
+| `runs.status` is `Cancelled` / `Crashed` / `Failed` | that status wins; still show counts for what was done before it ended |
+
+Note the engine may write more `operations` rows than the job targeted — the scan phase logs a row per file and the move phase logs another, and a `--move` additionally logs `Removed_Duplicate` cleanup rows. Count against the operation the user asked for rather than assuming one row per file.
+
+---
+
+### 5.6 Engine Invocation as a Trust Boundary
 
 Because the engine's flags are now assembled by FastAPI from HTTP request bodies rather than typed by someone with shell access, argument construction is a **security boundary**, not a convenience. Three rules follow:
 
@@ -255,7 +289,7 @@ Note also the `--file-ids` length ceiling described in §2: the 1,000-item selec
 
 ---
 
-### 5.6 Single Active Job Enforcement
+### 5.7 Single Active Job Enforcement
 
 Only one engine process may run at a time — see `project-spec.md` §4.1/§7 for the engine-level guarantee (an OS-level `flock`, held for the whole process lifetime, released automatically even on a hard `SIGKILL`). This is enforced in two layers, not one:
 
@@ -410,7 +444,7 @@ Updates global engine settings.
 
 POST /api/v1/jobs/start
 
-Starts an engine execution job, automatically injecting active configuration parameters from /settings if not explicitly overridden. `file_ids` and `source_subdir` are mutually exclusive — provide one or neither (a full directory scan), never both. Returns `409 Conflict` if another job is already running (§5.6) instead of spawning a doomed subprocess.
+Starts an engine execution job, automatically injecting active configuration parameters from /settings if not explicitly overridden. `file_ids` and `source_subdir` are mutually exclusive — provide one or neither (a full directory scan), never both. Returns `409 Conflict` if another job is already running (§5.7) instead of spawning a doomed subprocess.
 
     Body (individual selection):
     JSON
@@ -439,6 +473,32 @@ Starts an engine execution job, automatically injecting active configuration par
 GET /api/v1/runs/{run_id}/operations
 
 Returns the full `operations` history for a run (`SELECT * FROM operations WHERE run_id = ? ORDER BY timestamp`). Used for the reconnect replay in §4.1/§5.2 — always called before subscribing to a run's live WebSocket stream, not just after a detected disconnect, so the log is complete regardless of when the client first connected.
+
+GET /api/v1/runs/{run_id}
+
+Returns a run with its **derived** outcome (§5.5). `status` is the engine's lifecycle value and `outcome` is computed from the `operations` rows — never render `status` alone, since a run where every file failed still reports `Completed`.
+
+    Response:
+    JSON
+
+    {
+      "id": 47,
+      "mode": "MOVE",
+      "status": "Completed",
+      "started_at": "2026-02-14T10:28:03Z",
+      "ended_at": "2026-02-14T10:31:11Z",
+      "targeting": { "source_subdir": "sd_card/day1" },
+      "outcome": {
+        "verdict": "failed",
+        "succeeded": 0,
+        "failed": 23,
+        "cancelled": 0,
+        "removed_duplicates": 0,
+        "summary": "0 of 23 succeeded"
+      }
+    }
+
+`verdict` is one of `success`, `partial`, `failed`, `cancelled`, `crashed`, `running`, resolved by the rules in §5.5. `targeting` echoes the decoded `runs.file_ids_filter` object (§6.1) so the UI can show what the job was scoped to.
 
 POST /api/v1/jobs/{id}/cancel
 

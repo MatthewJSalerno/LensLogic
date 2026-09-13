@@ -174,6 +174,14 @@ LOCK_FILENAME = "engine.lock"
 # a real 'Completed' audit state with a spurious 'Failed'.
 SOURCE_CONSUMED_STATUSES = ('Completed', 'Removed_Duplicate')
 
+# Recorded in each photo's metadata_json as "date_source", so it is always
+# answerable after the fact where a file's date — and therefore its YYYY/MM/DD
+# folder — actually came from. EXIF timestamps carry no timezone and are used
+# exactly as the camera wrote them; a filesystem mtime is interpreted in the
+# container's timezone, so only DATE_SOURCE_MTIME files are affected by TZ.
+DATE_SOURCE_EXIF = "exif"
+DATE_SOURCE_MTIME = "file_mtime"
+
 # Bumped whenever the on-disk schema or the MEANING of a stored value changes.
 # CREATE TABLE IF NOT EXISTS cannot alter an existing table, so anything beyond
 # adding a brand-new table needs a migration step in _migrate_schema().
@@ -548,6 +556,53 @@ def log_operation(conn: sqlite3.Connection, run_id: int, photo_id: Optional[int]
         conn.commit()
 
 
+def drain_result_queue(db_thread: threading.Thread):
+    """
+    Waits for the writer to consume every queued result — but never forever.
+
+    Queue.join() blocks until task_done() has been called for each item, which
+    can only happen while the writer is alive. If it has died the queue can
+    never drain and join() hangs until something external kills the process:
+    no error, no log line, just a run that never ends. Observed exactly once in
+    CI as a 300-second timeout with a clean log above it, which is precisely
+    what an unobservable hang looks like.
+
+    Checking liveness between bounded waits turns that into an immediate,
+    named failure.
+    """
+    while True:
+        with result_queue.all_tasks_done:
+            if result_queue.unfinished_tasks == 0:
+                return
+            result_queue.all_tasks_done.wait(timeout=1.0)
+            if result_queue.unfinished_tasks == 0:
+                return
+        if not db_thread.is_alive():
+            raise RuntimeError(
+                f"Database writer thread died with {result_queue.unfinished_tasks} result(s) "
+                f"still queued — aborting instead of waiting forever. Check the log above for "
+                f"the error that killed it."
+            )
+
+
+def put_result(result, db_thread: threading.Thread):
+    """
+    Hands a result to the writer. Same reasoning as drain_result_queue: the
+    queue is bounded (DB_QUEUE_SIZE), so a dead writer makes put() block
+    forever once it fills. Fails loudly instead.
+    """
+    while True:
+        try:
+            result_queue.put(result, timeout=1.0)
+            return
+        except queue.Full:
+            if not db_thread.is_alive():
+                raise RuntimeError(
+                    "Database writer thread died and the result queue is full — aborting. "
+                    "Check the log above for the error that killed it."
+                )
+
+
 # --- Database Consumer (Thread) ---
 def db_writer_worker(db_path: str):
     """
@@ -572,11 +627,25 @@ def db_writer_worker(db_path: str):
 
     pending_writes = 0
     last_flush = time.monotonic()
+    date_sources = {DATE_SOURCE_EXIF: 0, DATE_SOURCE_MTIME: 0}
 
     def flush():
+        """
+        Commits the pending batch. NEVER raises: this is called from the
+        queue-timeout and sentinel paths, which sit outside the per-row
+        try/except, so an exception here would kill the writer thread — and a
+        dead writer means task_done() is never called again, so the main
+        thread blocks on the queue forever with nothing logged. That exact
+        failure mode is why the per-row body is wrapped (see below); these two
+        call sites reintroduced it when commit batching was added.
+        """
         nonlocal pending_writes, last_flush
-        if pending_writes:
-            conn.commit()
+        try:
+            if pending_writes:
+                conn.commit()
+                pending_writes = 0
+        except Exception as e:
+            logger.error(f"DB writer failed to commit a batch of {pending_writes} row(s): {e}")
             pending_writes = 0
         last_flush = time.monotonic()
 
@@ -670,6 +739,10 @@ def db_writer_worker(db_path: str):
                 conn, result.run_id, photo_id, result.file_path, result.dest_path, status,
                 result.error_message, result.has_name_collision, commit=False
             )
+            source = result.metadata.get("date_source") if result.metadata else None
+            if source in date_sources:
+                date_sources[source] += 1
+
             pending_writes += 1
             if pending_writes >= DB_COMMIT_BATCH_SIZE or (
                 time.monotonic() - last_flush >= DB_COMMIT_INTERVAL_SECONDS
@@ -684,6 +757,23 @@ def db_writer_worker(db_path: str):
         flush()
     except Exception as e:
         logger.error(f"DB writer failed to flush its final batch: {e}")
+
+    # Where each file's date came from, and therefore which files the
+    # container's timezone actually affected. EXIF timestamps carry no zone and
+    # are used as the camera wrote them; an mtime is interpreted in local time,
+    # so a photo modified late in the evening can land in the next day's folder
+    # under a different TZ. Surfacing the count makes that visible per run
+    # instead of being something you discover in the organized tree later.
+    from_exif = date_sources[DATE_SOURCE_EXIF]
+    from_mtime = date_sources[DATE_SOURCE_MTIME]
+    if from_exif or from_mtime:
+        logger.info(f"Date sources: {from_exif} from EXIF, {from_mtime} from file modification time.")
+    if from_mtime:
+        logger.warning(
+            f"{from_mtime} file(s) had no usable EXIF date and were filed by modification time. "
+            f"Those dates are interpreted in this container's timezone (logged above) — "
+            f"pass -e TZ=<zone> if the folders look a day off."
+        )
     conn.close()
     logger.info("Database worker thread shut down cleanly.")
 
@@ -858,7 +948,16 @@ def _shutdown_worker_exiftool():
     global _worker_exiftool
     if _worker_exiftool is not None:
         try:
-            _worker_exiftool.terminate()
+            # Bounded: ProcessPoolExecutor's shutdown waits for every worker,
+            # and this runs via atexit in each of them, so an ExifTool process
+            # that will not exit stalls the whole run's teardown. PyExifTool
+            # defaults to a 30s wait per instance, which across several workers
+            # and several back-to-back invocations is long enough to look
+            # indistinguishable from a hang.
+            try:
+                _worker_exiftool.terminate(wait_timeout=5)
+            except TypeError:
+                _worker_exiftool.terminate()
         except Exception:
             pass
         _worker_exiftool = None
@@ -965,27 +1064,30 @@ def get_metadata_and_date(file_path: Path) -> tuple:
     already self-heals from that in get_full_exif_via_exiftool(); this is
     the next layer down if a file just doesn't yield usable metadata at all.
     """
+    def _mtime_fallback(meta: dict) -> tuple:
+        meta["date_source"] = DATE_SOURCE_MTIME
+        return datetime.fromtimestamp(os.path.getmtime(file_path)), meta
+
     metadata = get_full_exif_via_exiftool(file_path)
     if metadata:
         dt = extract_date_from_metadata(metadata)
         if dt:
+            metadata["date_source"] = DATE_SOURCE_EXIF
             return dt, metadata
         # ExifTool ran but found no usable date tag — still keep whatever
         # metadata it did find, just fall through for the date itself.
-        fallback_dt = datetime.fromtimestamp(os.path.getmtime(file_path))
-        return fallback_dt, metadata
+        return _mtime_fallback(metadata)
 
     metadata = get_exif_via_pil(file_path)
     if metadata:
         dt = extract_date_from_metadata(metadata)
         if dt:
+            metadata["date_source"] = DATE_SOURCE_EXIF
             return dt, metadata
-        fallback_dt = datetime.fromtimestamp(os.path.getmtime(file_path))
-        return fallback_dt, metadata
+        return _mtime_fallback(metadata)
 
     # Neither source found anything at all.
-    fallback_dt = datetime.fromtimestamp(os.path.getmtime(file_path))
-    return fallback_dt, {}
+    return _mtime_fallback({})
 
 
 def compute_sha1(file_path: str) -> str:
@@ -1515,6 +1617,19 @@ def main():
     logger.info(f"Source Directory: {source_path}")
     logger.info(f"Destination Directory: {dest_path}")
     logger.info(f"Database Path: {db_path}")
+
+    # Log the resolved timezone explicitly: it silently decides which
+    # YYYY/MM/DD folder a file lands in, and a container defaults to UTC
+    # regardless of the host's zone unless TZ is passed in. EXIF dates are
+    # used exactly as the camera recorded them (they carry no zone, so no
+    # conversion happens), but the file-mtime fallback — every file without a
+    # usable EXIF date — is interpreted in this zone. A photo taken at 21:00
+    # local buckets into the NEXT day under UTC.
+    _local_now = datetime.now().astimezone()
+    logger.info(
+        f"Timezone: {_local_now.tzname()} (UTC{_local_now.strftime('%z')}) — "
+        f"used for date bucketing when a file has no EXIF date. Pass -e TZ=<zone> to change it."
+    )
     if args.file_ids:
         logger.info(f"Targeted file IDs: {args.file_ids}")
     if subdir_filter_path is not None:
@@ -1613,12 +1728,14 @@ def main():
                 batch = files_to_process[batch_start:batch_start + scan_batch_size]
                 futures = [executor.submit(process_file_task, f, str(dest_path), run_id) for f in batch]
                 for future in futures:
-                    result_queue.put(future.result())
+                    put_result(future.result(), db_thread)
                 scanned += len(batch)
 
-        result_queue.join()
+        drain_result_queue(db_thread)
         result_queue.put(None)
-        db_thread.join()
+        db_thread.join(timeout=60)
+        if db_thread.is_alive():
+            logger.error("Database writer did not shut down within 60s — continuing without it.")
 
         if cancel_requested.is_set():
             logger.info(
@@ -1831,6 +1948,37 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
 
         if duplicate_records:
             logger.info(f"Duplicate cleanup: removed {removed_count} of {len(duplicate_records)} flagged duplicates.")
+
+    # Point every duplicate at the copy that actually exists.
+    #
+    # A Duplicate row keeps the dest_path projected for it at Index time — a
+    # path under its OWN filename that is never written, because only Pending
+    # rows are copied. The row therefore described a file that does not exist,
+    # which is useless precisely when it matters: answering "this source file
+    # was a duplicate, so where did its content actually end up?"
+    #
+    # Rewriting it to the surviving copy's real path makes each duplicate
+    # record a usable pointer. The group is already queryable by sha1_hash;
+    # this makes each member individually answerable too. Runs after the
+    # move/copy loop and duplicate cleanup, so the anchor's dest_path is final
+    # (collision suffixes included) rather than still a projection.
+    if not was_cancelled:
+        cursor.execute(
+            "UPDATE photos SET dest_path = ("
+            "    SELECT anchor.dest_path FROM photos AS anchor"
+            "     WHERE anchor.sha1_hash = photos.sha1_hash"
+            "       AND anchor.status IN ('Completed', 'Copied')"
+            "     LIMIT 1)"
+            " WHERE status IN ('Duplicate', 'Removed_Duplicate')"
+            "   AND EXISTS ("
+            "    SELECT 1 FROM photos AS anchor"
+            "     WHERE anchor.sha1_hash = photos.sha1_hash"
+            "       AND anchor.status IN ('Completed', 'Copied'))" + predicate,
+            predicate_params
+        )
+        if cursor.rowcount:
+            logger.info(f"Repointed {cursor.rowcount} duplicate record(s) at the verified copy they match.")
+        conn.commit()
 
     conn.close()
 

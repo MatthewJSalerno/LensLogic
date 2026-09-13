@@ -66,6 +66,13 @@ docker run --rm \
 ## Configuration & Notes
 
 - **User Mapping:** `PUID`/`PGID` match the container process permissions to your host user, preventing root-owned output files.
+- **Timezone (`TZ`):** Controls which `YYYY/MM/DD` folder a photo lands in when it has **no usable EXIF date** and the engine falls back to the file's modification time. A container does **not** inherit your workstation's timezone — it runs UTC unless told otherwise — so a file modified at 21:00 local time can be filed under the *next* day. Pass your zone to avoid that:
+
+  ```bash
+  -e TZ=America/New_York
+  ```
+
+  Photos that *do* carry an EXIF date are unaffected: those timestamps have no timezone attached and are used exactly as the camera recorded them, which is almost always what you want. The engine logs the zone it resolved at startup (`Timezone: EDT (UTC-0400)`), so you can confirm the setting took effect rather than assuming it did.
 - **Volume Layout:**
   - `/data/source`: Raw input directory containing photos.
   - `/data/dest`: Structured target directory organized by `YYYY/MM/DD` format.
