@@ -428,7 +428,7 @@ def targeting_nothing_says_why():
           f"the warning did not say how to fix it; log said:\n{out}")
 
     out = engine_output(run_engine(case, "--copy", "--file-ids", "1,2,3"))
-    check("did not resolve to work for this run" in out,
+    check("IDs exist only for files a previous Index recorded" in out,
           f"an unresolvable --file-ids selection did not explain itself; log said:\n{out}")
 
     # And once indexed, the same scoped command finds its file.
