@@ -1277,18 +1277,29 @@ def compute_sha1(file_path: str) -> str:
 @contextlib.contextmanager
 def warnings_attributed_to(file_path: str):
     """
-    Captures library warnings raised while decoding one file and re-logs them
+    Captures library warnings raised while reading one file and re-logs them
     naming that file.
 
-    PIL's "Truncated File Read" arrives with no indication of WHICH file is
-    truncated — on a 29,000-file library that is an alarm with no address,
-    which is worse than useless. Attaching the path makes it a work item.
+    Two problems this solves:
+
+    1. The warnings arrive with no indication of WHICH file produced them — on
+       a 29,000-file library that is an alarm with no address.
+
+    2. The wording is actively misleading. PIL's "Truncated File Read" is
+       raised by ImageFile._safe_read as an OSError, then caught and
+       downgraded to a warning by TiffImagePlugin's EXIF IFD parser
+       (ImageFileDirectory_v2.load). It therefore means "the EXIF metadata
+       block is malformed", NOT "the image is truncated" — the parser
+       returns early and the pixel data decodes normally. Files that emit
+       this warning still produce a correct SHA-1 and a correct pHash; the
+       only loss is EXIF tags after the bad one, which can push a photo onto
+       its mtime for dating. Saying "metadata warning" keeps that straight.
     """
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         yield
     for w in caught:
-        logger.warning(f"{w.category.__name__} decoding {file_path}: {w.message}")
+        logger.warning(f"{w.category.__name__} metadata warning for {file_path}: {w.message}")
 
 
 def compute_phash(file_path: str) -> str:
