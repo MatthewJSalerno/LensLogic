@@ -218,10 +218,6 @@ SUPPORTED_EXTENSIONS = RASTER_EXTENSIONS | RAW_EXTENSIONS
 # perceptual-hash matching, which SQLite is the wrong shape for.
 DB_FILENAME = "ns_sqlite.db"
 
-# Databases written before the NegativeSpace rename. Adopted automatically on
-# startup; see adopt_legacy_database().
-LEGACY_DB_FILENAMES = ("photo_hashes.db",)
-
 PARTIAL_SUFFIX = ".organizing.partial"
 LOCK_FILENAME = "engine.lock"
 
@@ -549,67 +545,6 @@ def get_db_connection(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
     return conn
-
-
-def adopt_legacy_database(db_dir: Path) -> Path:
-    """
-    Returns the database path to use, renaming a pre-rename database into
-    place if one is found.
-
-    The file was called photo_hashes.db for the life of the project under its
-    old name. Simply switching DB_FILENAME would have been silently
-    destructive: the engine would find no database, create an empty one, and
-    re-index the entire library from scratch — 25 minutes and 118 GB of
-    network reads for the maintainer's collection, with the previous catalog
-    (including every Completed/Removed_Duplicate audit state proving a file
-    was already migrated) left orphaned on disk under the old name.
-
-    The WAL is checkpointed before the rename. SQLite keeps recently committed
-    pages in <name>-wal until a checkpoint folds them back into the main
-    database; renaming the .db alone would strand that tail, because the
-    reopened database looks for its WAL under the NEW name and never finds the
-    old one. TRUNCATE forces everything into the main file first, after which
-    the sidecars hold nothing worth keeping.
-
-    Safe to call on every startup: it is a no-op once the new name exists, and
-    it runs after the single-instance lock is held, so no other engine process
-    can be mid-write.
-    """
-    db_path = db_dir / DB_FILENAME
-    if db_path.exists():
-        return db_path
-
-    for legacy_name in LEGACY_DB_FILENAMES:
-        legacy_path = db_dir / legacy_name
-        if not legacy_path.exists():
-            continue
-        try:
-            conn = sqlite3.connect(str(legacy_path))
-            try:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-            finally:
-                conn.close()
-            legacy_path.rename(db_path)
-            for suffix in ("-wal", "-shm"):
-                sidecar = legacy_path.with_name(legacy_path.name + suffix)
-                if sidecar.exists():
-                    sidecar.unlink()
-            logger.info(
-                f"Adopted existing catalog: renamed {legacy_name} to {DB_FILENAME}. "
-                f"Nothing was re-indexed."
-            )
-        except (OSError, sqlite3.Error) as e:
-            # Keep using the legacy file rather than failing the run or
-            # silently starting an empty catalog. The rename is a tidiness
-            # measure; losing the catalog over it would not be.
-            logger.warning(
-                f"Could not rename {legacy_name} to {DB_FILENAME} ({type(e).__name__}: {e}). "
-                f"Continuing with the existing file."
-            )
-            return legacy_path
-        return db_path
-
-    return db_path
 
 
 # --- Database Schema Initialization ---
@@ -2151,10 +2086,6 @@ def main():
             f"Wait for it to finish, or cancel it, then retry."
         )
         sys.exit(1)
-
-    # 2a-i. Adopt a pre-rename catalog, if one is here. Must run with the
-    # lock held and before anything opens the database.
-    db_path = adopt_legacy_database(db_dir)
 
     # 2b. ExifTool is a hard requirement (module docstring) — fail fast and
     # clearly, before touching source/dest/the database at all, rather than
