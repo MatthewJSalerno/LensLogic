@@ -225,12 +225,6 @@ LEGACY_DB_FILENAMES = ("photo_hashes.db",)
 PARTIAL_SUFFIX = ".organizing.partial"
 LOCK_FILENAME = "engine.lock"
 
-# Statuses whose source file is legitimately gone because a prior --move run
-# consumed it on purpose. Targeted re-runs skip these rather than re-scanning
-# them: the source is *supposed* to be missing, so re-indexing would overwrite
-# a real 'Completed' audit state with a spurious 'Failed'.
-SOURCE_CONSUMED_STATUSES = ('Completed', 'Removed_Duplicate')
-
 # Recorded in each photo's metadata_json as "date_source", so it is always
 # answerable after the fact where a file's date — and therefore its YYYY/MM/DD
 # folder — actually came from. EXIF timestamps carry no timezone and are used
@@ -239,10 +233,95 @@ SOURCE_CONSUMED_STATUSES = ('Completed', 'Removed_Duplicate')
 DATE_SOURCE_EXIF = "exif"
 DATE_SOURCE_MTIME = "file_mtime"
 
+# --- Status vocabularies -----------------------------------------------------
+#
+# Every value any of the three tables may hold in its `status` column, named
+# once. These were previously 38 scattered string literals with no enumeration
+# anywhere, which fails in a specific and silent way: SQLite accepted any
+# string, and a misspelling in a WHERE clause matches zero rows rather than
+# raising. A typo in the duplicate-cleanup anchor check would simply stop
+# removing duplicate sources; a typo in the 'Processing' marker would make
+# crash recovery blind to a file interrupted mid-move. Nothing would error and
+# nothing would be logged.
+#
+# The CHECK constraints below are generated from these same tuples, so the
+# database enforces exactly the set the code knows about — including against
+# Phase 2's API and ad-hoc sqlite3 sessions, neither of which import this
+# module.
+
+class PhotoStatus:
+    """State of one source file in the catalog. One row per source_path."""
+    PENDING = "Pending"                       # catalogued, not yet acted on
+    PROCESSING = "Processing"                 # durable crash-recovery marker; see _run_move_or_copy
+    COMPLETED = "Completed"                   # --move finished: copied, verified, source deleted
+    COPIED = "Copied"                         # --copy finished: copied, verified, source kept
+    FAILED = "Failed"                          # unreadable, vanished, or the write failed
+    DUPLICATE = "Duplicate"                   # identical SHA-1 to another row holding an anchor status
+    REMOVED_DUPLICATE = "Removed_Duplicate"   # duplicate whose source was deleted against a verified copy
+
+
+class RunStatus:
+    """Outcome of one engine invocation."""
+    RUNNING = "Running"
+    COMPLETED = "Completed"
+    CANCELLED = "Cancelled"
+    FAILED = "Failed"
+    CRASHED = "Crashed"                       # left 'Running' by an unclean exit, marked at next startup
+
+
+# 'Cancelled' appears in the audit log but never on a photo: work cancelled
+# before it started leaves the photo row Pending, so the file is picked up
+# again by a re-run. The operations row records that the run reached it and
+# stopped.
+OPERATION_CANCELLED = "Cancelled"
+
+PHOTO_STATUSES = (
+    PhotoStatus.PENDING, PhotoStatus.PROCESSING, PhotoStatus.COMPLETED,
+    PhotoStatus.COPIED, PhotoStatus.FAILED, PhotoStatus.DUPLICATE,
+    PhotoStatus.REMOVED_DUPLICATE,
+)
+OPERATION_STATUSES = PHOTO_STATUSES + (OPERATION_CANCELLED,)
+RUN_STATUSES = (
+    RunStatus.RUNNING, RunStatus.COMPLETED, RunStatus.CANCELLED,
+    RunStatus.FAILED, RunStatus.CRASHED,
+)
+
+# Statuses that mean "already delivered to the destination and verified".
+ANCHOR_DELIVERED_STATUSES = (PhotoStatus.COMPLETED, PhotoStatus.COPIED)
+
+# Statuses that represent a settled record — the file has been examined and
+# its row is trustworthy. partition_unchanged() will only skip re-reading a
+# file whose row is in one of these; anything mid-flight or failed is always
+# rescanned rather than trusted on the strength of a stat.
+SETTLED_STATUSES = (
+    PhotoStatus.PENDING, PhotoStatus.COMPLETED, PhotoStatus.COPIED,
+    PhotoStatus.DUPLICATE, PhotoStatus.REMOVED_DUPLICATE,
+)
+
+# Statuses whose source file is legitimately gone because a prior --move run
+# consumed it on purpose. Targeted re-runs skip these rather than re-scanning
+# them: the source is *supposed* to be missing, so re-indexing would overwrite
+# a real Completed audit state with a spurious Failed.
+SOURCE_CONSUMED_STATUSES = (PhotoStatus.COMPLETED, PhotoStatus.REMOVED_DUPLICATE)
+
+
+def sql_values(statuses) -> str:
+    """Renders a status tuple as a SQL literal list: "'Pending', 'Failed'".
+
+    Values are module constants, never user input — but they are still
+    validated as bare identifiers-with-underscores so this can never become a
+    string-building hole if someone adds a value carelessly.
+    """
+    for value in statuses:
+        if not value.replace("_", "").isalnum():
+            raise ValueError(f"status value is not a bare word, refusing to inline it: {value!r}")
+    return ", ".join(f"'{v}'" for v in statuses)
+
+
 # Bumped whenever the on-disk schema or the MEANING of a stored value changes.
 # CREATE TABLE IF NOT EXISTS cannot alter an existing table, so anything beyond
 # adding a brand-new table needs a migration step in _migrate_schema().
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # --- Dependency Check ---
 try:
@@ -550,7 +629,7 @@ def init_database(db_path: str):
     """
     conn = get_db_connection(db_path)
     cursor = conn.cursor()
-    cursor.execute("""
+    cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS photos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source_path TEXT UNIQUE,
@@ -563,10 +642,11 @@ def init_database(db_path: str):
             metadata_json TEXT,
             has_name_collision BOOLEAN DEFAULT 0,
             file_size INTEGER,
-            file_mtime REAL
+            file_mtime REAL,
+            CHECK (status IS NULL OR status IN ({sql_values(PHOTO_STATUSES)}))
         )
     """)
-    cursor.execute("""
+    cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             mode TEXT NOT NULL,
@@ -575,10 +655,11 @@ def init_database(db_path: str):
             file_ids_filter TEXT,
             started_at TEXT NOT NULL,
             ended_at TEXT,
-            status TEXT NOT NULL
+            status TEXT NOT NULL,
+            CHECK (status IN ({sql_values(RUN_STATUSES)}))
         )
     """)
-    cursor.execute("""
+    cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS operations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id INTEGER NOT NULL,
@@ -590,6 +671,7 @@ def init_database(db_path: str):
             error_message TEXT,
             has_name_collision BOOLEAN DEFAULT 0,
             timestamp TEXT NOT NULL,
+            CHECK (status IN ({sql_values(OPERATION_STATUSES)})),
             FOREIGN KEY(run_id) REFERENCES runs(id),
             FOREIGN KEY(photo_id) REFERENCES photos(id)
         )
@@ -684,6 +766,130 @@ def _migrate_schema(conn: sqlite3.Connection):
                 conn.execute(f"ALTER TABLE photos ADD COLUMN {column} {decl}")
         logger.info("Schema migration v1->v2: added change-detection columns to photos.")
 
+    if current < 3:
+        # v2 -> v3: CHECK constraints on every status column.
+        #
+        # SQLite has no ALTER TABLE ADD CONSTRAINT, so each table is rebuilt
+        # under its new definition and its rows copied across. That is the
+        # documented procedure, and it is safe here because DDL participates
+        # in the surrounding transaction: either every table ends up
+        # constrained with all its rows, or nothing changes.
+        #
+        # Existing data is validated BEFORE any rebuild starts. A row holding
+        # a value outside the vocabulary would otherwise fail the copy
+        # partway through with a constraint error naming no row, which is a
+        # miserable thing to debug on someone's real catalog. Checking first
+        # means the engine can name the offending values and leave the
+        # database exactly as it found it.
+        offenders = []
+        for table, allowed, nullable in (
+            ("photos", PHOTO_STATUSES, True),
+            ("runs", RUN_STATUSES, False),
+            ("operations", OPERATION_STATUSES, False),
+        ):
+            if not conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone():
+                continue
+            null_clause = " AND status IS NOT NULL" if nullable else ""
+            rows = conn.execute(
+                f"SELECT DISTINCT status FROM {table} "
+                f"WHERE status NOT IN ({sql_values(allowed)}){null_clause}"
+            ).fetchall()
+            offenders.extend((table, r[0]) for r in rows)
+
+        if offenders:
+            detail = ", ".join(f"{t}.status={v!r}" for t, v in offenders)
+            raise sqlite3.IntegrityError(
+                "Cannot apply schema v3: the catalog holds status values outside the known "
+                f"vocabulary ({detail}). This means something wrote a status this engine does "
+                "not recognise. The database has NOT been modified. Correct or remove those "
+                "rows, then re-run."
+            )
+
+        # photos: column list is spelled out rather than using SELECT *, so a
+        # column added later cannot silently change the copy's meaning.
+        conn.execute(f"""
+            CREATE TABLE photos_v3 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT UNIQUE,
+                dest_path TEXT,
+                sha1_hash TEXT,
+                phash TEXT,
+                collision_group INTEGER,
+                is_master BOOLEAN DEFAULT 0,
+                status TEXT,
+                metadata_json TEXT,
+                has_name_collision BOOLEAN DEFAULT 0,
+                file_size INTEGER,
+                file_mtime REAL,
+                CHECK (status IS NULL OR status IN ({sql_values(PHOTO_STATUSES)}))
+            )
+        """)
+        conn.execute(
+            "INSERT INTO photos_v3 (id, source_path, dest_path, sha1_hash, phash, collision_group, "
+            "is_master, status, metadata_json, has_name_collision, file_size, file_mtime) "
+            "SELECT id, source_path, dest_path, sha1_hash, phash, collision_group, is_master, "
+            "status, metadata_json, has_name_collision, file_size, file_mtime FROM photos"
+        )
+        conn.execute("DROP TABLE photos")
+        conn.execute("ALTER TABLE photos_v3 RENAME TO photos")
+
+        conn.execute(f"""
+            CREATE TABLE runs_v3 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mode TEXT NOT NULL,
+                source_path TEXT,
+                dest_path TEXT,
+                file_ids_filter TEXT,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                status TEXT NOT NULL,
+                CHECK (status IN ({sql_values(RUN_STATUSES)}))
+            )
+        """)
+        conn.execute(
+            "INSERT INTO runs_v3 (id, mode, source_path, dest_path, file_ids_filter, started_at, "
+            "ended_at, status) SELECT id, mode, source_path, dest_path, file_ids_filter, "
+            "started_at, ended_at, status FROM runs"
+        )
+        conn.execute("DROP TABLE runs")
+        conn.execute("ALTER TABLE runs_v3 RENAME TO runs")
+
+        conn.execute(f"""
+            CREATE TABLE operations_v3 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                photo_id INTEGER,
+                original_filename TEXT,
+                source_path TEXT,
+                dest_path TEXT,
+                status TEXT NOT NULL,
+                error_message TEXT,
+                has_name_collision BOOLEAN DEFAULT 0,
+                timestamp TEXT NOT NULL,
+                CHECK (status IN ({sql_values(OPERATION_STATUSES)})),
+                FOREIGN KEY(run_id) REFERENCES runs(id),
+                FOREIGN KEY(photo_id) REFERENCES photos(id)
+            )
+        """)
+        conn.execute(
+            "INSERT INTO operations_v3 (id, run_id, photo_id, original_filename, source_path, "
+            "dest_path, status, error_message, has_name_collision, timestamp) "
+            "SELECT id, run_id, photo_id, original_filename, source_path, dest_path, status, "
+            "error_message, has_name_collision, timestamp FROM operations"
+        )
+        conn.execute("DROP TABLE operations")
+        conn.execute("ALTER TABLE operations_v3 RENAME TO operations")
+
+        # DROP TABLE takes the old indexes with it. init_database() recreates
+        # them immediately after this function returns, which is why they live
+        # in that idempotent block rather than here.
+        logger.info(
+            "Schema migration v2->v3: status columns are now constrained to their known "
+            "vocabularies."
+        )
+
     conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)};")
     conn.commit()
 
@@ -709,8 +915,9 @@ def start_run(
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO runs (mode, source_path, dest_path, file_ids_filter, started_at, status) "
-        "VALUES (?, ?, ?, ?, ?, 'Running')",
-        (mode, source_path, dest_path, targeting_filter, datetime.now().isoformat())
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (mode, source_path, dest_path, targeting_filter, datetime.now().isoformat(),
+         RunStatus.RUNNING)
     )
     conn.commit()
     run_id = cursor.lastrowid
@@ -887,14 +1094,14 @@ def db_writer_worker(db_path: str):
             # should count as "the original."
             cursor.execute(
                 "SELECT id FROM photos WHERE sha1_hash = ? AND source_path != ? "
-                "AND status NOT IN ('Duplicate', 'Removed_Duplicate')",
+                f"AND status NOT IN ({sql_values((PhotoStatus.DUPLICATE, PhotoStatus.REMOVED_DUPLICATE))})",
                 (result.sha1_hash, result.file_path)
             )
             existing = cursor.fetchone()
 
             status = result.status
-            if existing and status != "Failed":
-                status = "Duplicate"
+            if existing and status != PhotoStatus.FAILED:
+                status = PhotoStatus.DUPLICATE
 
             # FIX: UPSERT on source_path instead of a blind INSERT. This is
             # the direct fix for the crash — re-scanning a file already
@@ -979,12 +1186,12 @@ def db_writer_worker(db_path: str):
     if total:
         breakdown = ", ".join(f"{n:,} {st.lower()}" for st, n in sorted(status_counts.items()))
         logger.info(f"Index summary: {total:,} file(s) recorded — {breakdown}.")
-        failed = status_counts.get("Failed", 0)
+        failed = status_counts.get(PhotoStatus.FAILED, 0)
         if failed:
             logger.warning(
                 f"{failed:,} file(s) failed and were recorded with a reason — query them with: "
                 f"SELECT source_path, error_message FROM operations "
-                f"WHERE status = 'Failed' AND run_id = (SELECT MAX(id) FROM runs);"
+                f"WHERE status = '{PhotoStatus.FAILED}' AND run_id = (SELECT MAX(id) FROM runs);"
             )
         if phash_failures:
             logger.warning(
@@ -1022,7 +1229,9 @@ def reconcile_interrupted_state(db_path: Path):
             conn.close()
             return
 
-        cursor.execute("SELECT id, source_path, dest_path FROM photos WHERE status = 'Processing'")
+        cursor.execute(
+            f"SELECT id, source_path, dest_path FROM photos WHERE status = '{PhotoStatus.PROCESSING}'"
+        )
         stuck_records = cursor.fetchall()
 
         for record_id, src_str, dst_str in stuck_records:
@@ -1036,10 +1245,12 @@ def reconcile_interrupted_state(db_path: Path):
 
             if dst.exists() and not src.exists():
                 logger.info(f"Reconciled completed move for record {record_id}: {dst.name}")
-                cursor.execute("UPDATE photos SET status = 'Completed' WHERE id = ?", (record_id,))
+                cursor.execute("UPDATE photos SET status = ? WHERE id = ?",
+                               (PhotoStatus.COMPLETED, record_id))
             else:
                 logger.info(f"Resetting interrupted record {record_id} to Pending.")
-                cursor.execute("UPDATE photos SET status = 'Pending' WHERE id = ?", (record_id,))
+                cursor.execute("UPDATE photos SET status = ? WHERE id = ?",
+                               (PhotoStatus.PENDING, record_id))
 
         # FIX: a run that was killed uncatchably (SIGKILL, OOM-kill, power
         # loss — anything that bypasses main()'s try/finally) never reaches
@@ -1053,13 +1264,13 @@ def reconcile_interrupted_state(db_path: Path):
         # accordingly.
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='runs';")
         if cursor.fetchone():
-            cursor.execute("SELECT id FROM runs WHERE status = 'Running'")
+            cursor.execute("SELECT id FROM runs WHERE status = ?", (RunStatus.RUNNING,))
             orphaned_runs = cursor.fetchall()
             for (run_id,) in orphaned_runs:
                 logger.warning(f"Run #{run_id} was left 'Running' by an unclean shutdown — marking Crashed.")
                 cursor.execute(
-                    "UPDATE runs SET status = 'Crashed', ended_at = ? WHERE id = ?",
-                    (datetime.now().isoformat(), run_id)
+                    "UPDATE runs SET status = ?, ended_at = ? WHERE id = ?",
+                    (RunStatus.CRASHED, datetime.now().isoformat(), run_id)
                 )
 
         conn.commit()
@@ -1666,7 +1877,7 @@ def log_scan_progress(scanned: int, total: int, started_at: float,
 def _failed_result(file_path_str: str, run_id: int, error_message: str) -> ProcessingResult:
     """Builds the Failed result for a file that could not be scanned at all."""
     return ProcessingResult(
-        file_path=file_path_str, sha1_hash="", phash="", metadata={}, status="Failed",
+        file_path=file_path_str, sha1_hash="", phash="", metadata={}, status=PhotoStatus.FAILED,
         dest_path="", run_id=run_id, error_message=error_message
     )
 
@@ -1732,7 +1943,7 @@ def process_file_task(file_path_str: str, dest_base_path: str, run_id: int) -> P
             sha1_hash=sha1,
             phash=phash,
             metadata=metadata,
-            status="Pending",
+            status=PhotoStatus.PENDING,
             dest_path=str(target_folder / file_path.name),
             run_id=run_id,
             has_name_collision=False,
@@ -1917,7 +2128,7 @@ def partition_unchanged(db_path: str, candidates: List[str], force: bool = False
             for row in conn.execute(
                 "SELECT source_path, file_size, file_mtime FROM photos "
                 "WHERE file_size IS NOT NULL AND file_mtime IS NOT NULL "
-                "AND status IN ('Pending', 'Completed', 'Copied', 'Duplicate', 'Removed_Duplicate')"
+                f"AND status IN ({sql_values(SETTLED_STATUSES)})"
             )
         }
     finally:
@@ -2147,7 +2358,17 @@ def main():
         logger.info(f"Targeted source subdirectory: {subdir_filter_path}")
 
     # 3. Schema + Startup Recovery
-    init_database(str(db_path))
+    try:
+        init_database(str(db_path))
+    except sqlite3.IntegrityError as e:
+        # Raised by the v2->v3 migration when the catalog holds a status value
+        # outside the known vocabulary. The database is untouched; surface it
+        # the way the other fatal startup conditions are surfaced rather than
+        # as a traceback, since the message already names the problem and the
+        # remedy.
+        logger.error(f"FATAL: {e}")
+        release_single_instance_lock(lock_fd)
+        sys.exit(1)
     reconcile_interrupted_state(db_path)
 
     # 4. Register cancellation handlers and open the run record. Everything
@@ -2160,7 +2381,7 @@ def main():
     run_id = start_run(
         str(db_path), mode_label, str(source_path), str(dest_path), args.file_ids, args.source_subdir
     )
-    run_outcome = "Failed"
+    run_outcome = RunStatus.FAILED
 
     try:
         # 5. Start DB Writer Thread
@@ -2323,7 +2544,7 @@ def main():
                 f"Scan cancelled after {scanned} file(s) — skipping the move/copy phase. "
                 f"Everything already indexed is saved; re-run to continue."
             )
-            run_outcome = "Cancelled"
+            run_outcome = RunStatus.CANCELLED
         else:
             gb = bytes_done / 1e9
             elapsed = time.monotonic() - scan_started_at
@@ -2335,18 +2556,18 @@ def main():
             if args.move or args.copy:
                 run_outcome = _run_move_or_copy(args, db_path, dest_path, run_id)
             else:
-                run_outcome = "Completed"
+                run_outcome = RunStatus.COMPLETED
                 logger.info(
                     "Index finished. Pass `--move` to move files, or `--copy` to copy them non-destructively."
                 )
 
     finally:
-        if cancel_requested.is_set() and run_outcome != "Cancelled":
+        if cancel_requested.is_set() and run_outcome != RunStatus.CANCELLED:
             # Cancellation arrived during the scan phase itself (before the
             # move/copy loop even started) — nothing file-level to log as
             # Cancelled yet since no per-file work was scoped out, but the
             # run itself still needs to be marked accordingly.
-            run_outcome = "Cancelled"
+            run_outcome = RunStatus.CANCELLED
         finish_run(str(db_path), run_id, run_outcome)
         logger.info(f"Run #{run_id} finished with status: {run_outcome}")
         release_single_instance_lock(lock_fd)
@@ -2366,7 +2587,8 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
 
     predicate, predicate_params = _targeting_predicate(args)
     cursor.execute(
-        "SELECT id, source_path, dest_path FROM photos WHERE status = 'Pending'" + predicate,
+        f"SELECT id, source_path, dest_path FROM photos WHERE status = '{PhotoStatus.PENDING}'"
+        + predicate,
         predicate_params
     )
     pending_records = cursor.fetchall()
@@ -2392,7 +2614,7 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
     if not verify_sufficient_disk_space(dest_path, total_bytes_needed):
         logger.error("Aborting due to insufficient space on destination drive.")
         conn.close()
-        return "Failed"
+        return RunStatus.FAILED
 
     logger.info(
         f"Disk space verified. {action_verb} {len(pending_records)} items "
@@ -2406,7 +2628,8 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
             remaining = pending_records[index:]
             logger.warning(f"Cancellation requested — logging {len(remaining)} remaining item(s) as Cancelled.")
             for cancelled_id, cancelled_src, cancelled_dst in remaining:
-                log_operation(conn, run_id, cancelled_id, cancelled_src, cancelled_dst, "Cancelled")
+                log_operation(conn, run_id, cancelled_id, cancelled_src, cancelled_dst,
+                              OPERATION_CANCELLED)
             break
 
         # Resolve the final filename HERE, immediately before the file is
@@ -2443,13 +2666,13 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
             if args.move:
                 try:
                     retry_io_operation(f"Delete already-copied source {Path(src).name}", Path(src).unlink)
-                    final_status = "Completed"
+                    final_status = PhotoStatus.COMPLETED
                     skip_error = None
                 except Exception as e:
-                    final_status = "Failed"
+                    final_status = PhotoStatus.FAILED
                     skip_error = f"{type(e).__name__}: {e}"
             else:
-                final_status = "Copied"
+                final_status = PhotoStatus.COPIED
                 skip_error = None
             cursor.execute(
                 "UPDATE photos SET status = ?, dest_path = ? WHERE id = ?",
@@ -2487,7 +2710,8 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
         # The fsync cost this would otherwise pay is addressed instead by
         # synchronous=NORMAL (see get_db_connection), which keeps the ordering
         # guarantees intact against process death.
-        cursor.execute("UPDATE photos SET status = 'Processing' WHERE id = ?", (record_id,))
+        cursor.execute("UPDATE photos SET status = ? WHERE id = ?",
+                       (PhotoStatus.PROCESSING, record_id))
         conn.commit()
 
         # --move deletes the verified source (delete_source=True, the
@@ -2495,9 +2719,9 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
         success, error_message = copy_verify_delete(src, resolved_dst, delete_source=args.move)
 
         if args.move:
-            final_status = "Completed" if success else "Failed"
+            final_status = PhotoStatus.COMPLETED if success else PhotoStatus.FAILED
         else:
-            final_status = "Copied" if success else "Failed"
+            final_status = PhotoStatus.COPIED if success else PhotoStatus.FAILED
         cursor.execute("UPDATE photos SET status = ? WHERE id = ?", (final_status, record_id))
         conn.commit()
         log_operation(conn, run_id, record_id, src, resolved_dst, final_status, error_message, has_collision)
@@ -2516,7 +2740,8 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
         # WHOLE library regardless: a two-file --file-ids move would happily
         # delete duplicate source files nowhere near the user's selection.
         cursor.execute(
-            "SELECT id, source_path, sha1_hash FROM photos WHERE status = 'Duplicate'" + predicate,
+            f"SELECT id, source_path, sha1_hash FROM photos WHERE status = '{PhotoStatus.DUPLICATE}'"
+            + predicate,
             predicate_params
         )
         duplicate_records = cursor.fetchall()
@@ -2527,18 +2752,21 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
                 continue  # already gone (e.g. handled in a prior run)
 
             cursor.execute(
-                "SELECT dest_path FROM photos WHERE sha1_hash = ? AND status = 'Completed' LIMIT 1",
+                f"SELECT dest_path FROM photos WHERE sha1_hash = ? "
+                f"AND status = '{PhotoStatus.COMPLETED}' LIMIT 1",
                 (sha1_hash,)
             )
             match = cursor.fetchone()
             if match and Path(match[0]).exists():
                 try:
                     retry_io_operation(f"Deleting verified duplicate {dup_src.name}", dup_src.unlink)
-                    cursor.execute("UPDATE photos SET status = 'Removed_Duplicate' WHERE id = ?", (record_id,))
+                    cursor.execute("UPDATE photos SET status = ? WHERE id = ?",
+                                   (PhotoStatus.REMOVED_DUPLICATE, record_id))
                     conn.commit()
                     removed_count += 1
                     logger.info(f"Removed duplicate source file: {dup_src} (verified copy at {match[0]})")
-                    log_operation(conn, run_id, record_id, dup_src_str, match[0], "Removed_Duplicate")
+                    log_operation(conn, run_id, record_id, dup_src_str, match[0],
+                                  PhotoStatus.REMOVED_DUPLICATE)
                 except Exception as e:
                     logger.error(f"Failed to remove duplicate source file {dup_src}: {e}")
             else:
@@ -2568,13 +2796,13 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
             "UPDATE photos SET dest_path = ("
             "    SELECT anchor.dest_path FROM photos AS anchor"
             "     WHERE anchor.sha1_hash = photos.sha1_hash"
-            "       AND anchor.status IN ('Completed', 'Copied')"
+            f"       AND anchor.status IN ({sql_values(ANCHOR_DELIVERED_STATUSES)})"
             "     LIMIT 1)"
-            " WHERE status IN ('Duplicate', 'Removed_Duplicate')"
+            f" WHERE status IN ({sql_values((PhotoStatus.DUPLICATE, PhotoStatus.REMOVED_DUPLICATE))})"
             "   AND EXISTS ("
             "    SELECT 1 FROM photos AS anchor"
             "     WHERE anchor.sha1_hash = photos.sha1_hash"
-            "       AND anchor.status IN ('Completed', 'Copied'))" + predicate,
+            f"       AND anchor.status IN ({sql_values(ANCHOR_DELIVERED_STATUSES)}))" + predicate,
             predicate_params
         )
         if cursor.rowcount:
@@ -2585,10 +2813,10 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
 
     if was_cancelled:
         logger.info(f"{'Move' if args.move else 'Copy'} operation cancelled by user request.")
-        return "Cancelled"
+        return RunStatus.CANCELLED
 
     logger.info(f"All {'move' if args.move else 'copy'} operations finished.")
-    return "Completed"
+    return RunStatus.COMPLETED
 
 
 if __name__ == "__main__":

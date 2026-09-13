@@ -149,6 +149,12 @@ Three tables, each with a distinct role — this replaced an earlier, simpler si
 | `has_name_collision` | Boolean | As of this specific operation |
 | `timestamp` | Text | ISO timestamp |
 
+**Status vocabularies are enforced, not merely documented.** Each of the three `status` columns carries a `CHECK` constraint listing exactly the values above (`photos.status` also permits `NULL`, since a row can exist before its scan result lands). The constraint text is generated from the same Python tuples the engine uses — `PHOTO_STATUSES`, `RUN_STATUSES`, `OPERATION_STATUSES` in `ns-engine.py` — so the database and the code cannot drift apart.
+
+This exists because the failure mode is silent. SQLite accepts any string in a bare `TEXT` column, and a misspelled status in a `WHERE` clause matches zero rows rather than raising: a typo in the duplicate-cleanup anchor check would simply stop removing duplicate sources, and a typo in the `Processing` marker would make crash recovery blind to a file interrupted mid-move. Nothing would error and nothing would be logged.
+
+It matters most for Phase 2, which adds a second codebase reading and writing these columns without importing the engine's constants. A web layer that writes `'copied'` or filters on `'Complete'` now fails loudly at write time instead of quietly disagreeing with the engine about what the catalog contains. Anything writing to this database — including ad-hoc `sqlite3` sessions — is held to the same vocabulary.
+
 **Design note — why three tables instead of columns on `photos`:** `photos` answers "what's the current state of this file?" — a single `error_message` column there could only ever hold the *most recent* attempt's outcome, and couldn't show that a file failed twice with different errors before eventually succeeding, or answer "show me everything that happened in run #47." Splitting current-state (`photos`) from historical audit log (`operations`, joined to `runs` for run-level context) answers both without overloading one table with two different jobs.
 
 ## 7. Non-Functional Requirements

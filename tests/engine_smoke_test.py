@@ -739,6 +739,48 @@ def schema_is_versioned_and_indexed():
 
 
 @test
+def status_columns_are_constrained():
+    """Schema: every status column rejects a value outside its vocabulary."""
+    case = new_case("statuscheck")
+    make_photo(case / "src" / "a.jpg", "a")
+    run_engine(case)
+
+    # The valid statuses used to exist only as scattered string literals with
+    # nothing constraining the column, so a typo matched zero rows instead of
+    # raising — silent in exactly the places it matters (crash recovery, the
+    # duplicate-cleanup anchor check). Phase 2 adds a second codebase writing
+    # this column, so the database has to enforce the vocabulary itself.
+    conn = db(case)
+    try:
+        check(conn.execute("PRAGMA user_version").fetchone()[0] >= 3,
+              "schema did not reach v3")
+
+        for sql, params, label in (
+            ("INSERT INTO photos (source_path, status) VALUES ('/typo.jpg', ?)",
+             ("Complete",), "photos.status"),
+            ("INSERT INTO runs (mode, started_at, status) VALUES ('INDEX', 't', ?)",
+             ("Runnin",), "runs.status"),
+            ("INSERT INTO operations (run_id, status, timestamp) VALUES (1, ?, 't')",
+             ("copied",), "operations.status"),
+        ):
+            try:
+                conn.execute(sql, params)
+                raise Fail(f"{label} accepted a value outside its vocabulary")
+            except sqlite3.IntegrityError:
+                pass
+
+        # A legal value still goes in, so the constraint is not simply
+        # rejecting everything.
+        conn.execute("INSERT INTO photos (source_path, status) VALUES ('/ok.jpg', 'Pending')")
+        # NULL stays legal on photos: a row can exist before its scan result
+        # lands.
+        conn.execute("INSERT INTO photos (source_path, status) VALUES ('/null.jpg', NULL)")
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+@test
 def batched_scan_records_every_file():
     """Batched commits: a scan larger than one batch still persists every row."""
     case = new_case("batching")
