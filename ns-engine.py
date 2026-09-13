@@ -174,7 +174,32 @@ PROGRESS_INTERVAL_SECONDS = 15.0
 SHA1_CHUNK_SIZE = 65536
 MAX_RETRIES = 3
 INITIAL_RETRY_DELAY = 1.0  # Seconds
-SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.tiff', '.raw', '.dng', '.cr2', '.nef', '.arw', '.raf'}
+# Extensions scanned by default. A missing entry is worse than a failure: the
+# file is not indexed, not counted, not reported — it is simply invisible, and
+# you find out when it is still sitting in the source folder after an organize
+# pass. '.tif' was absent while '.tiff' was present, which silently skipped
+# every TIFF written by the more common spelling.
+SUPPORTED_EXTENSIONS = {
+    # Common raster
+    '.jpg', '.jpeg', '.jpe', '.jfif', '.png', '.gif', '.bmp', '.webp',
+    '.tif', '.tiff', '.heic', '.heif', '.avif',
+    # RAW, by vendor
+    '.raw', '.dng',           # generic / Adobe
+    '.cr2', '.cr3', '.crw',   # Canon
+    '.nef', '.nrw',           # Nikon
+    '.arw', '.srf', '.sr2',   # Sony
+    '.raf',                   # Fujifilm
+    '.orf',                   # Olympus
+    '.rw2',                   # Panasonic
+    '.pef', '.ptx',           # Pentax
+    '.srw',                   # Samsung
+    '.erf',                   # Epson
+    '.3fr', '.fff',           # Hasselblad
+    '.iiq',                   # Phase One
+    '.mos',                   # Leaf
+    '.mrw',                   # Minolta
+    '.x3f',                   # Sigma
+}
 PARTIAL_SUFFIX = ".organizing.partial"
 LOCK_FILENAME = "engine.lock"
 
@@ -228,7 +253,20 @@ try:
 except ImportError:
     RAWPY_SUPPORTED = False
 
-RAW_EXTENSIONS = {'.raw', '.dng', '.cr2', '.nef', '.arw', '.raf'}
+# Formats that need rawpy/LibRaw to decode — PIL cannot open these at all, so
+# compute_phash() must route them to the RAW branch. Kept in sync with the RAW
+# entries in SUPPORTED_EXTENSIONS above; a format listed there but missing here
+# would be handed to PIL and always fail its perceptual hash.
+RAW_EXTENSIONS = {
+    '.raw', '.dng',
+    '.cr2', '.cr3', '.crw',
+    '.nef', '.nrw',
+    '.arw', '.srf', '.sr2',
+    '.raf', '.orf', '.rw2',
+    '.pef', '.ptx', '.srw',
+    '.erf', '.3fr', '.fff',
+    '.iiq', '.mos', '.mrw', '.x3f',
+}
 
 # --- Dependency Check: ExifTool is a HARD requirement (see module docstring
 # for why) — checked here, enforced with a clear fatal error in main(). Two
@@ -1570,6 +1608,54 @@ def is_hidden_path(path: Path, root: Path) -> bool:
     return any(part.startswith('.') for part in relative.parts)
 
 
+def discover_source_files(root: Path, extensions: set) -> List[str]:
+    """
+    Walks `root` and returns the files worth scanning.
+
+    Uses os.scandir rather than Path.rglob because of what each costs on a
+    NETWORK share. rglob yields bare paths, so the caller must then ask
+    p.is_file() and p.is_symlink() — two stat() calls per entry, and over NFS a
+    stat() is a round trip rather than a page-cache hit. A real library spent
+    28-40 seconds merely enumerating 29,047 files, which is almost exactly
+    29,047 x 2 x ~0.5ms of round trips. os.scandir's DirEntry carries the type
+    from readdir(), so the same walk usually needs no extra syscall at all;
+    measured 8x faster even on a local filesystem, where there is no network
+    latency to hide.
+
+    The extension test is also checked BEFORE the filesystem questions, so a
+    directory full of video or sidecar files costs string comparisons instead
+    of syscalls.
+    """
+    found: List[str] = []
+    stack = [str(root)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    # A leading dot at any level: skip the whole subtree. This
+                    # covers .Trashes/, .Spotlight-V100/ and macOS AppleDouble
+                    # sidecars ("._IMG_0001.jpg") that carry real photo
+                    # extensions and would otherwise index as photographs.
+                    if entry.name.startswith('.'):
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                            continue
+                        if os.path.splitext(entry.name)[1].lower() not in extensions:
+                            continue
+                        if entry.is_file(follow_symlinks=False):
+                            found.append(entry.path)
+                    except OSError as e:
+                        logger.warning(f"Could not inspect {entry.path}: {e}")
+        except OSError as e:
+            # An unreadable directory must not abort the whole scan, for the
+            # same reason an unreadable file does not.
+            logger.warning(f"Could not read directory {current}: {e}")
+    return found
+
+
 def normalize_extensions(raw: str) -> set:
     """
     Parses --exts into the form Path.suffix actually produces.
@@ -1810,12 +1896,7 @@ def main():
             files_to_process = _query_source_subdir(str(db_path), subdir_filter_path)
             logger.info(f"Targeting {len(files_to_process)} already-indexed file(s) under source subdirectory.")
         else:
-            files_to_process = [
-                str(p) for p in source_path.rglob('*')
-                if p.is_file() and not p.is_symlink()
-                and p.suffix.lower() in active_extensions
-                and not is_hidden_path(p, source_path)
-            ]
+            files_to_process = discover_source_files(source_path, active_extensions)
             logger.info(
                 f"Discovered {len(files_to_process)} supported photo/image files to scan "
                 f"(extensions: {', '.join(sorted(active_extensions))})."
