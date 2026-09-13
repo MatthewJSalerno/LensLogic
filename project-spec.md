@@ -47,7 +47,7 @@ To balance heavy-duty data processing with a high-quality user experience, the a
 
 ## 4. Functional Requirements
 ### 4.1. Input & Configuration
-*   **Path Definitions:** `--source` (default `/data/source`), `--dest` (default `/data/dest`), and `--base` (default `/appdata`, holding `<base>/db/photo_hashes.db` and `<base>/logs/organizer.log`).
+*   **Path Definitions:** `--source` (default `/data/source`), `--dest` (default `/data/dest`), and `--base` (default `/appdata`, holding `<base>/db/ns_sqlite.db` and `<base>/logs/organizer.log`).
 *   **Tuning:**
     *   `--workers <N>` — overrides the `ProcessPoolExecutor` worker count (default: `os.cpu_count()`).
     *   `--exts <.ext1,.ext2,...>` — overrides the default extension set for directory scanning. Has no effect on `--file-ids` targeting.

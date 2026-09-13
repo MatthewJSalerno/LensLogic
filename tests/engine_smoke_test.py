@@ -103,7 +103,7 @@ def spawn_engine(case, *args):
 
 
 def db(case):
-    conn = sqlite3.connect(case / "appdata" / "db" / "photo_hashes.db")
+    conn = sqlite3.connect(case / "appdata" / "db" / "ns_sqlite.db")
     conn.row_factory = sqlite3.Row
     return conn
 
