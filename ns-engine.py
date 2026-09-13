@@ -220,7 +220,7 @@ DATE_SOURCE_MTIME = "file_mtime"
 # Bumped whenever the on-disk schema or the MEANING of a stored value changes.
 # CREATE TABLE IF NOT EXISTS cannot alter an existing table, so anything beyond
 # adding a brand-new table needs a migration step in _migrate_schema().
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # --- Dependency Check ---
 try:
@@ -330,6 +330,7 @@ class ProcessingResult:
     is_master: bool = False
     error_message: Optional[str] = None
     file_size: int = 0
+    file_mtime: float = 0.0
 
 
 # --- Producer-Consumer Queue ---
@@ -491,7 +492,9 @@ def init_database(db_path: str):
             is_master BOOLEAN DEFAULT 0,
             status TEXT,
             metadata_json TEXT,
-            has_name_collision BOOLEAN DEFAULT 0
+            has_name_collision BOOLEAN DEFAULT 0,
+            file_size INTEGER,
+            file_mtime REAL
         )
     """)
     cursor.execute("""
@@ -572,6 +575,21 @@ def _migrate_schema(conn: sqlite3.Connection):
                 migrated += 1
         if migrated:
             logger.info(f"Schema migration v0->v1: rewrote {migrated} legacy run targeting filter(s).")
+
+    if current < 2:
+        # v1 -> v2: file_size and file_mtime, so a re-index can tell an
+        # unchanged file from a changed one without reading it. Existing rows
+        # get NULL, which reads as "unknown" and forces one full re-index of
+        # that file — correct, and self-correcting after a single pass.
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(photos)")}
+        for column, decl in (("file_size", "INTEGER"), ("file_mtime", "REAL")):
+            if column not in existing:
+                conn.execute(f"ALTER TABLE photos ADD COLUMN {column} {decl}")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_photos_source_stat "
+            "ON photos(source_path, file_size, file_mtime)"
+        )
+        logger.info("Schema migration v1->v2: added change-detection columns to photos.")
 
     conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)};")
     conn.commit()
@@ -794,8 +812,8 @@ def db_writer_worker(db_path: str):
             cursor.execute(
                 """INSERT INTO photos
                    (source_path, dest_path, sha1_hash, phash, collision_group, is_master, status,
-                    metadata_json, has_name_collision)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    metadata_json, has_name_collision, file_size, file_mtime)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(source_path) DO UPDATE SET
                        dest_path = excluded.dest_path,
                        sha1_hash = excluded.sha1_hash,
@@ -804,7 +822,9 @@ def db_writer_worker(db_path: str):
                        is_master = excluded.is_master,
                        status = excluded.status,
                        metadata_json = excluded.metadata_json,
-                       has_name_collision = excluded.has_name_collision
+                       has_name_collision = excluded.has_name_collision,
+                       file_size = excluded.file_size,
+                       file_mtime = excluded.file_mtime
                 """,
                 (
                     result.file_path,
@@ -815,7 +835,9 @@ def db_writer_worker(db_path: str):
                     1 if result.is_master else 0,
                     status,
                     json.dumps(result.metadata),
-                    1 if result.has_name_collision else 0
+                    1 if result.has_name_collision else 0,
+                    result.file_size,
+                    result.file_mtime
                 )
             )
 
@@ -1548,9 +1570,10 @@ def process_file_task(file_path_str: str, dest_base_path: str, run_id: int) -> P
         # report THROUGHPUT rather than only a file count — see
         # log_scan_progress for why that distinction matters.
         try:
-            file_size = file_path.stat().st_size
+            _st = file_path.stat()
+            file_size, file_mtime = _st.st_size, _st.st_mtime
         except OSError:
-            file_size = 0
+            file_size, file_mtime = 0, 0.0
 
         sha1 = compute_sha1(str(file_path))
         phash = compute_phash(str(file_path))
@@ -1584,7 +1607,8 @@ def process_file_task(file_path_str: str, dest_base_path: str, run_id: int) -> P
             dest_path=str(target_folder / file_path.name),
             run_id=run_id,
             has_name_collision=False,
-            file_size=file_size
+            file_size=file_size,
+            file_mtime=file_mtime
         )
     except Exception as e:
         return _failed_result(file_path_str, run_id, f"{type(e).__name__}: {e}")
@@ -1728,6 +1752,71 @@ def discover_source_files(root: Path, extensions: set) -> List[str]:
     return found
 
 
+def partition_unchanged(db_path: str, candidates: List[str], force: bool = False) -> tuple:
+    """
+    Splits discovered files into (to_scan, unchanged), returning paths whose
+    size and mtime still match what the catalog recorded as `unchanged`.
+
+    Re-indexing previously read EVERY file in full — SHA-1 over the whole file,
+    a complete pixel decode for the perceptual hash, and an ExifTool pass —
+    because nothing consulted the catalog before doing the work, and SHA-1
+    cannot be used to skip: it is the RESULT of reading the file, not something
+    knowable beforehand. Two consecutive indexes of one 29,047-file library
+    took 24m57s and 25m27s; the second gained nothing from the first.
+
+    Comparing size and mtime costs one stat per file instead of reading it —
+    roughly 21 MB of network traffic replaced by a single metadata round trip
+    for a RAW file. A library that has not changed re-indexes in seconds.
+
+    Rows predating this check have NULL size/mtime, which reads as "unknown"
+    and forces one full pass for those files; it is self-correcting after that.
+    A file whose row is not in a settled state is always rescanned, so
+    interrupted or failed work is never skipped on the strength of a stat.
+
+    force=True bypasses the comparison entirely (--force-rehash), for when the
+    concern is content changed without size or mtime moving — which editors do
+    not do in practice, but verification should not require deleting the
+    database.
+    """
+    if force or not candidates:
+        return list(candidates), []
+
+    conn = get_db_connection(db_path)
+    try:
+        known = {
+            row[0]: (row[1], row[2])
+            for row in conn.execute(
+                "SELECT source_path, file_size, file_mtime FROM photos "
+                "WHERE file_size IS NOT NULL AND file_mtime IS NOT NULL "
+                "AND status IN ('Pending', 'Completed', 'Copied', 'Duplicate', 'Removed_Duplicate')"
+            )
+        }
+    finally:
+        conn.close()
+
+    if not known:
+        return list(candidates), []
+
+    to_scan, unchanged = [], []
+    for path in candidates:
+        recorded = known.get(path)
+        if recorded is None:
+            to_scan.append(path)
+            continue
+        try:
+            st = os.stat(path)
+        except OSError:
+            # Cannot stat it, so cannot claim it is unchanged. Let the normal
+            # pipeline record the real failure with its reason.
+            to_scan.append(path)
+            continue
+        if recorded[0] == st.st_size and abs(recorded[1] - st.st_mtime) < 1e-6:
+            unchanged.append(path)
+        else:
+            to_scan.append(path)
+    return to_scan, unchanged
+
+
 def normalize_extensions(raw: str) -> set:
     """
     Parses --exts into the form Path.suffix actually produces.
@@ -1791,6 +1880,13 @@ def main():
         "--exts", type=str, default=None,
         help="Comma-separated list of extensions to scan (e.g. '.jpg,.png'), replacing the built-in default set. "
              "Only affects directory scanning, not --file-ids targeting."
+    )
+    parser.add_argument(
+        "--force-rehash", action="store_true",
+        help="Re-read every file even if its size and modification time are unchanged since the "
+             "last Index. Normally unchanged files are skipped without being read at all, which "
+             "is what makes re-indexing fast; use this to verify content that changed without "
+             "size or mtime moving."
     )
     targeting_group = parser.add_mutually_exclusive_group()
     targeting_group.add_argument(
@@ -1968,11 +2064,22 @@ def main():
             files_to_process = _query_source_subdir(str(db_path), subdir_filter_path)
             logger.info(f"Targeting {len(files_to_process)} already-indexed file(s) under source subdirectory.")
         else:
-            files_to_process = discover_source_files(source_path, active_extensions)
+            discovered = discover_source_files(source_path, active_extensions)
+            files_to_process, unchanged = partition_unchanged(
+                str(db_path), discovered, force=args.force_rehash
+            )
             logger.info(
-                f"Discovered {len(files_to_process)} supported photo/image files to scan "
+                f"Discovered {len(discovered):,} supported photo/image files "
                 f"(extensions: {', '.join(sorted(active_extensions))})."
             )
+            if unchanged:
+                logger.info(
+                    f"Skipping {len(unchanged):,} unchanged file(s) — size and modification time "
+                    f"still match the catalog, so they are not re-read. "
+                    f"{len(files_to_process):,} file(s) to scan. Pass --force-rehash to re-read everything."
+                )
+            elif args.force_rehash:
+                logger.info("--force-rehash: re-reading every file regardless of the catalog.")
 
         # Submitted in bounded batches rather than all at once. Every
         # completed future holds its ProcessingResult — including the FULL
