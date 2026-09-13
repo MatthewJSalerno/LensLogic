@@ -18,6 +18,14 @@ Options:
     --filter NAME   run only tests whose name contains NAME
     -v              show engine stdout for each run
 
+Environment:
+    NS_TEST_RAW_DIR  Folder of genuine RAW files (.cr2/.nef/.arw/.raf/.dng) to
+                     exercise the rawpy decode path for real. That path cannot
+                     be covered with synthetic fixtures — LibRaw rejects
+                     fabricated files — so the test skips unless you point this
+                     at real camera output. Worth doing at least once: it is
+                     the only part of the engine no synthetic test can reach.
+
 Exit code is non-zero if any test fails.
 """
 
@@ -463,6 +471,82 @@ def sigkill_during_move_is_reconciled_and_loses_nothing():
     finished = len(dest_files(case))
     check(finished == count, f"expected {count} files at the destination, found {finished}")
     check(src_files(case) == [], f"source should be empty after completing the move: {src_files(case)}")
+
+
+@test
+def phash_is_computed_for_real_images():
+    """pHash: a real perceptual hash is stored, not 'not_supported' or 'error'."""
+    case = new_case("phash")
+    make_photo(case / "src" / "a.jpg", "phash-a")
+    make_photo(case / "src" / "b.jpg", "phash-b")
+    run_engine(case)
+
+    hashes = {Path(r["source_path"]).name: r["phash"]
+              for r in rows(case, "SELECT source_path, phash FROM photos")}
+    for name, ph in hashes.items():
+        check(ph not in ("not_supported", "error", None, ""),
+              f"{name}: pHash not computed ({ph!r}) — is imagehash installed?")
+        check(len(ph) >= 8 and all(c in "0123456789abcdef" for c in ph.lower()),
+              f"{name}: pHash does not look like a hex hash: {ph!r}")
+
+
+@test
+def raw_extension_routes_to_rawpy_and_fails_gracefully():
+    """
+    RAW: a .dng the decoder cannot read is recorded as 'error' and the file is
+    still indexed — it must not raise, and must not silently fall through to
+    PIL (which cannot decode RAW sensor data at all).
+    """
+    case = new_case("raw_route")
+    make_photo(case / "src" / "normal.jpg", "normal")
+    # A TIFF named .dng. LibRaw rejects it, which is exactly the failure this
+    # checks: the engine should degrade to 'error' for that one file, not die.
+    from PIL import Image
+    import numpy as np
+    arr = (np.random.rand(48, 64, 3) * 255).astype("uint8")
+    Image.fromarray(arr).save(case / "src" / "broken.dng", "TIFF")
+
+    run_engine(case)
+
+    statuses = {Path(r["source_path"]).name: (r["status"], r["phash"])
+                for r in rows(case, "SELECT source_path, status, phash FROM photos")}
+    check("broken.dng" in statuses, f"the .dng was not indexed at all: {statuses}")
+    status, phash = statuses["broken.dng"]
+    check(status == "Pending", f"an undecodable RAW should still index, got status {status}")
+    check(phash == "error",
+          f"expected phash 'error' for an undecodable RAW, got {phash!r} — "
+          f"'not_supported' means rawpy is missing; a real hash means it wrongly used PIL")
+    check(statuses["normal.jpg"][1] not in ("error", "not_supported"),
+          "the normal JPEG alongside it should still hash correctly")
+
+
+@test
+def real_raw_files_decode_when_supplied():
+    """
+    RAW decode: opt-in. Set NS_TEST_RAW_DIR to a folder of genuine RAW files
+    (.cr2/.nef/.arw/.dng/.raf) to exercise the rawpy decode path for real —
+    it cannot be synthesized, LibRaw rejects fabricated files.
+    """
+    raw_dir = os.environ.get("NS_TEST_RAW_DIR")
+    if not raw_dir or not Path(raw_dir).is_dir():
+        raise Fail("SKIP: set NS_TEST_RAW_DIR to a folder of real RAW files to run this")
+    sources = [p for p in Path(raw_dir).iterdir()
+               if p.suffix.lower() in {".cr2", ".nef", ".arw", ".raf", ".dng", ".raw"}]
+    if not sources:
+        raise Fail(f"SKIP: no RAW files found in {raw_dir}")
+
+    case = new_case("raw_real")
+    for p in sources[:5]:
+        shutil.copy2(p, case / "src" / p.name)
+    run_engine(case)
+
+    for r in rows(case, "SELECT source_path, status, phash, metadata_json FROM photos"):
+        name = Path(r["source_path"]).name
+        check(r["phash"] not in ("error", "not_supported", None, ""),
+              f"{name}: RAW pHash failed ({r['phash']!r})")
+        check(r["status"] == "Pending", f"{name}: expected Pending, got {r['status']}")
+        check(r["metadata_json"] and "date_taken" in r["metadata_json"],
+              f"{name}: no metadata captured from the RAW file")
 
 
 @test
