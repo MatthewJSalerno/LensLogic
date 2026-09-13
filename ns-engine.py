@@ -556,6 +556,53 @@ def log_operation(conn: sqlite3.Connection, run_id: int, photo_id: Optional[int]
         conn.commit()
 
 
+def drain_result_queue(db_thread: threading.Thread):
+    """
+    Waits for the writer to consume every queued result — but never forever.
+
+    Queue.join() blocks until task_done() has been called for each item, which
+    can only happen while the writer is alive. If it has died the queue can
+    never drain and join() hangs until something external kills the process:
+    no error, no log line, just a run that never ends. Observed exactly once in
+    CI as a 300-second timeout with a clean log above it, which is precisely
+    what an unobservable hang looks like.
+
+    Checking liveness between bounded waits turns that into an immediate,
+    named failure.
+    """
+    while True:
+        with result_queue.all_tasks_done:
+            if result_queue.unfinished_tasks == 0:
+                return
+            result_queue.all_tasks_done.wait(timeout=1.0)
+            if result_queue.unfinished_tasks == 0:
+                return
+        if not db_thread.is_alive():
+            raise RuntimeError(
+                f"Database writer thread died with {result_queue.unfinished_tasks} result(s) "
+                f"still queued — aborting instead of waiting forever. Check the log above for "
+                f"the error that killed it."
+            )
+
+
+def put_result(result, db_thread: threading.Thread):
+    """
+    Hands a result to the writer. Same reasoning as drain_result_queue: the
+    queue is bounded (DB_QUEUE_SIZE), so a dead writer makes put() block
+    forever once it fills. Fails loudly instead.
+    """
+    while True:
+        try:
+            result_queue.put(result, timeout=1.0)
+            return
+        except queue.Full:
+            if not db_thread.is_alive():
+                raise RuntimeError(
+                    "Database writer thread died and the result queue is full — aborting. "
+                    "Check the log above for the error that killed it."
+                )
+
+
 # --- Database Consumer (Thread) ---
 def db_writer_worker(db_path: str):
     """
@@ -583,9 +630,22 @@ def db_writer_worker(db_path: str):
     date_sources = {DATE_SOURCE_EXIF: 0, DATE_SOURCE_MTIME: 0}
 
     def flush():
+        """
+        Commits the pending batch. NEVER raises: this is called from the
+        queue-timeout and sentinel paths, which sit outside the per-row
+        try/except, so an exception here would kill the writer thread — and a
+        dead writer means task_done() is never called again, so the main
+        thread blocks on the queue forever with nothing logged. That exact
+        failure mode is why the per-row body is wrapped (see below); these two
+        call sites reintroduced it when commit batching was added.
+        """
         nonlocal pending_writes, last_flush
-        if pending_writes:
-            conn.commit()
+        try:
+            if pending_writes:
+                conn.commit()
+                pending_writes = 0
+        except Exception as e:
+            logger.error(f"DB writer failed to commit a batch of {pending_writes} row(s): {e}")
             pending_writes = 0
         last_flush = time.monotonic()
 
@@ -888,7 +948,16 @@ def _shutdown_worker_exiftool():
     global _worker_exiftool
     if _worker_exiftool is not None:
         try:
-            _worker_exiftool.terminate()
+            # Bounded: ProcessPoolExecutor's shutdown waits for every worker,
+            # and this runs via atexit in each of them, so an ExifTool process
+            # that will not exit stalls the whole run's teardown. PyExifTool
+            # defaults to a 30s wait per instance, which across several workers
+            # and several back-to-back invocations is long enough to look
+            # indistinguishable from a hang.
+            try:
+                _worker_exiftool.terminate(wait_timeout=5)
+            except TypeError:
+                _worker_exiftool.terminate()
         except Exception:
             pass
         _worker_exiftool = None
@@ -1659,12 +1728,14 @@ def main():
                 batch = files_to_process[batch_start:batch_start + scan_batch_size]
                 futures = [executor.submit(process_file_task, f, str(dest_path), run_id) for f in batch]
                 for future in futures:
-                    result_queue.put(future.result())
+                    put_result(future.result(), db_thread)
                 scanned += len(batch)
 
-        result_queue.join()
+        drain_result_queue(db_thread)
         result_queue.put(None)
-        db_thread.join()
+        db_thread.join(timeout=60)
+        if db_thread.is_alive():
+            logger.error("Database writer did not shut down within 60s — continuing without it.")
 
         if cancel_requested.is_set():
             logger.info(

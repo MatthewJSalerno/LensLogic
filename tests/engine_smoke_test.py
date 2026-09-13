@@ -70,7 +70,21 @@ def run_engine(case, *args, expect_rc=0, timeout=300):
            "--source", str(case / "src"),
            "--dest", str(case / "dest"),
            "--base", str(case / "appdata")] + [str(a) for a in args]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        # Surface what the engine managed to print before it stalled. Without
+        # this a hang reports only the command line — which is what happened in
+        # CI, leaving a 300-second timeout with nothing to diagnose it from.
+        # The last lines before the stall say which phase it died in.
+        raw = e.stdout or b""
+        partial = raw if isinstance(raw, str) else raw.decode("utf-8", "replace")
+        tail = "\n".join(f"      | {l}" for l in partial.splitlines()[-25:])
+        raise Fail(
+            f"engine did not finish within {timeout}s — a HANG, not a slow run.\n"
+            f"    args: {' '.join(str(a) for a in args) or '(index)'}\n"
+            f"    last output before it stalled:\n{tail or '      | (nothing captured)'}"
+        )
     if VERBOSE:
         print("\n".join("      | " + l for l in proc.stdout.splitlines()))
     if expect_rc is not None and proc.returncode != expect_rc:
