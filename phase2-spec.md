@@ -300,6 +300,21 @@ Only one engine process may run at a time — see `project-spec.md` §4.1/§7 fo
 1. **The engine process is genuinely still alive** (the common case) — FastAPI should treat this as an active job for UI purposes (allow reconnecting clients to replay/stream it per §4.1) without being able to directly re-attach to the subprocess's stdout; the `operations` log is what makes this possible without that direct attachment.
 2. **The engine process crashed too, before its own next-run reconciliation ever got a chance to mark that row `Crashed`** (`project-spec.md` §4.2) — this is a double-failure case (both the engine and FastAPI went down around the same time) that would otherwise leave a phantom `Running` row until someone happens to run the engine again. FastAPI can distinguish the two cases on its own startup by attempting a **non-blocking `flock` on the same lock file as a liveness probe** — if it succeeds (nothing holds the lock), no engine process actually owns that `Running` row, and FastAPI should immediately release the probe lock and mark the row `Crashed` itself, rather than waiting for a future engine invocation to notice.
 
+### 5.8 Index Is a Precondition for Move and Copy
+
+Move and Copy act on the catalog, never on the filesystem directly. Both targeting mechanisms — `--file-ids` and `--source-subdir` — resolve rows a previous Index recorded; neither walks the source tree. A Move or Copy issued against a source that has never been indexed therefore matches zero rows and does nothing.
+
+The engine reports this rather than hiding it: each targeting mode logs a warning naming the cause and the remedy when it matches nothing. But the engine can only explain the situation *after* the user has already waited for a job that was never going to do anything, and it deliberately does not treat an empty selection as an error — "nothing left to do" is the correct outcome for a re-run, and failing would break idempotency.
+
+Preventing the situation is the UI's job:
+
+* **The folder picker can only offer indexed folders.** Its tree should be built from `SELECT DISTINCT` over indexed `source_path` prefixes, not from a filesystem listing. A folder the user cannot select is a folder they cannot mis-target. This also matches what the user is choosing between — they are picking from photos the app knows about, not browsing a disk.
+* **Move and Copy are disabled while the catalog is empty**, with the control labelled to say why (*"Run a Scan first — NegativeSpace acts on indexed photos"*) rather than being inert with no explanation. `SELECT COUNT(*) FROM photos` is sufficient to drive this.
+* **A newly added source directory is not silently actionable.** A source the user has just configured has no rows until a Scan completes over it. The Settings flow that adds a source should offer to run that Scan immediately, so the common path never produces an un-indexed source.
+* **Stale scope is surfaced, not assumed.** `--source-subdir` sees only rows as of the last Index over that path, so files added to a folder since then are invisible to a Move or Copy targeting it. Where the UI shows a folder's file count, it should show when that folder was last scanned alongside it, so a user comparing "1,318 photos" against what they see in their file manager can tell the difference between a bug and a stale index.
+
+The general principle: the engine guarantees it will never act on something it has not catalogued, and says so when a selection resolves to nothing. The UI is responsible for making an empty selection hard to construct in the first place.
+
 ---
 
 ## 6. Database Schema & API Specifications

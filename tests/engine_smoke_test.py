@@ -58,6 +58,13 @@ def check(condition, message):
         raise Fail(message)
 
 
+def engine_output(proc):
+    """Everything the engine printed. Logging goes to stdout (configure_logging
+    attaches a StreamHandler on sys.stdout), but read both streams so a test
+    asserting on a log line cannot quietly pass or fail on the wrong one."""
+    return (proc.stdout or "") + (proc.stderr or "")
+
+
 def test(fn):
     """Registers a test function. Name doubles as the label."""
     RESULTS.append(fn)
@@ -103,7 +110,7 @@ def spawn_engine(case, *args):
 
 
 def db(case):
-    conn = sqlite3.connect(case / "appdata" / "db" / "photo_hashes.db")
+    conn = sqlite3.connect(case / "appdata" / "db" / "ns_sqlite.db")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -342,6 +349,94 @@ def source_subdir_targeting_is_scoped():
     remaining = src_files(case)
     check(sorted(remaining) == ["day1extra/d.jpg", "day2/c.jpg"],
           f"subdir targeting moved the wrong set; source still holds {remaining}")
+
+
+@test
+def source_subdir_with_wildcard_chars_is_literal():
+    """--source-subdir: '_' and '%' in a folder name are literal, not LIKE wildcards."""
+    case = new_case("subdirglob")
+    # The prefix match runs through SQL LIKE, where '_' means "any single
+    # character" and '%' means "any sequence". Unescaped, targeting My_Photos
+    # would also sweep in MyXPhotos — copying files the user never selected,
+    # or under --move deleting their sources. Folder names with underscores
+    # are ordinary, and Phase 2 lets users pick arbitrary folders.
+    make_photo(case / "src" / "My_Photos" / "a.jpg", "A")
+    make_photo(case / "src" / "My_Photos" / "nested" / "b.jpg", "B")
+    make_photo(case / "src" / "MyXPhotos" / "c.jpg", "C")
+    make_photo(case / "src" / "100%Done" / "d.jpg", "D")
+    make_photo(case / "src" / "100XDone" / "e.jpg", "E")
+
+    run_engine(case)
+    run_engine(case, "--move", "--source-subdir", "My_Photos")
+
+    remaining = sorted(src_files(case))
+    check(remaining == ["100%Done/d.jpg", "100XDone/e.jpg", "MyXPhotos/c.jpg"],
+          f"'_' was treated as a LIKE wildcard; source still holds {remaining}")
+
+    run_engine(case, "--move", "--source-subdir", "100%Done")
+
+    remaining = sorted(src_files(case))
+    check(remaining == ["100XDone/e.jpg", "MyXPhotos/c.jpg"],
+          f"'%' was treated as a LIKE wildcard; source still holds {remaining}")
+
+
+@test
+def targeted_runs_skip_unchanged_files():
+    """--source-subdir / --file-ids honour the unchanged-file skip, not just full scans."""
+    case = new_case("targetskip")
+    make_photo(case / "src" / "day1" / "a.jpg", "A")
+    make_photo(case / "src" / "day1" / "b.jpg", "B")
+    make_photo(case / "src" / "day2" / "c.jpg", "C")
+
+    run_engine(case)  # full index; everything now has size+mtime recorded
+
+    # A scoped re-run must not re-read files the catalog already matches.
+    # partition_unchanged() used to be applied only to the full-scan branch,
+    # so targeted runs re-hashed and re-decoded every file — the expensive
+    # path, on exactly the runs the web UI issues.
+    out = engine_output(run_engine(case, "--source-subdir", "day1"))
+    check("Skipping 2 unchanged file(s)" in out,
+          f"scoped re-run did not skip unchanged files; log said:\n{out}")
+
+    # Touching one file must bring exactly that file back into the scan.
+    target = case / "src" / "day1" / "a.jpg"
+    os.utime(target, (time.time() + 10, time.time() + 10))
+    out = engine_output(run_engine(case, "--source-subdir", "day1"))
+    check("Skipping 1 unchanged file(s)" in out,
+          f"a changed file was not re-scanned; log said:\n{out}")
+
+    # --force-rehash still overrides the skip.
+    out = engine_output(run_engine(case, "--source-subdir", "day1", "--force-rehash"))
+    check("Skipping" not in out and "force-rehash" in out,
+          f"--force-rehash did not bypass the skip; log said:\n{out}")
+
+
+@test
+def targeting_nothing_says_why():
+    """A scoped run against an un-indexed catalog explains itself instead of quietly succeeding."""
+    case = new_case("emptytarget")
+    make_photo(case / "src" / "day1" / "a.jpg", "A")
+
+    # No Index has ever run, so the catalog is empty. Both targeted modes read
+    # the catalog rather than the filesystem, so they match nothing — and the
+    # run would otherwise report "completed successfully (0 files)", which is
+    # indistinguishable from having had nothing to do.
+    out = engine_output(run_engine(case, "--copy", "--source-subdir", "day1"))
+    check("No indexed files found" in out,
+          f"a scoped copy against an empty catalog did not explain itself; log said:\n{out}")
+    check("Run an Index over this source first" in out,
+          f"the warning did not say how to fix it; log said:\n{out}")
+
+    out = engine_output(run_engine(case, "--copy", "--file-ids", "1,2,3"))
+    check("IDs exist only for files a previous Index recorded" in out,
+          f"an unresolvable --file-ids selection did not explain itself; log said:\n{out}")
+
+    # And once indexed, the same scoped command finds its file.
+    run_engine(case)
+    out = engine_output(run_engine(case, "--copy", "--source-subdir", "day1"))
+    check("No indexed files found" not in out,
+          f"scoped copy still reported an empty target after indexing; log said:\n{out}")
+    check((case / "dest").exists(), "scoped copy produced no destination tree after indexing")
 
 
 @test

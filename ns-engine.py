@@ -179,11 +179,10 @@ INITIAL_RETRY_DELAY = 1.0  # Seconds
 # you find out when it is still sitting in the source folder after an organize
 # pass. '.tif' was absent while '.tiff' was present, which silently skipped
 # every TIFF written by the more common spelling.
-SUPPORTED_EXTENSIONS = {
-    # Common raster
-    '.jpg', '.jpeg', '.jpe', '.jfif', '.png', '.gif', '.bmp', '.webp',
-    '.tif', '.tiff', '.heic', '.heif', '.avif',
-    # RAW, by vendor
+# Formats that need rawpy/LibRaw to decode. PIL cannot open these at all, so
+# compute_phash() routes them to the RAW branch; a format that reached PIL
+# instead would always fail its perceptual hash.
+RAW_EXTENSIONS = {
     '.raw', '.dng',           # generic / Adobe
     '.cr2', '.cr3', '.crw',   # Canon
     '.nef', '.nrw',           # Nikon
@@ -200,6 +199,29 @@ SUPPORTED_EXTENSIONS = {
     '.mrw',                   # Minolta
     '.x3f',                   # Sigma
 }
+
+# Everything PIL can open directly.
+RASTER_EXTENSIONS = {
+    '.jpg', '.jpeg', '.jpe', '.jfif', '.png', '.gif', '.bmp', '.webp',
+    '.tif', '.tiff', '.heic', '.heif', '.avif',
+}
+
+# Derived, never hand-maintained. These two sets used to be written out
+# separately with a comment asking the next editor to keep them in sync — a
+# RAW format added to SUPPORTED_EXTENSIONS but missed in RAW_EXTENSIONS would
+# be discovered by the scan, handed to PIL, and silently store "error" as its
+# perceptual hash for every file of that type. Deriving the union removes the
+# possibility rather than documenting it.
+SUPPORTED_EXTENSIONS = RASTER_EXTENSIONS | RAW_EXTENSIONS
+# The storage engine is named in the file so a second store can sit beside it
+# without ambiguity — Phase 3 may add a DuckDB companion for all-pairs
+# perceptual-hash matching, which SQLite is the wrong shape for.
+DB_FILENAME = "ns_sqlite.db"
+
+# Databases written before the NegativeSpace rename. Adopted automatically on
+# startup; see adopt_legacy_database().
+LEGACY_DB_FILENAMES = ("photo_hashes.db",)
+
 PARTIAL_SUFFIX = ".organizing.partial"
 LOCK_FILENAME = "engine.lock"
 
@@ -253,20 +275,6 @@ try:
 except ImportError:
     RAWPY_SUPPORTED = False
 
-# Formats that need rawpy/LibRaw to decode — PIL cannot open these at all, so
-# compute_phash() must route them to the RAW branch. Kept in sync with the RAW
-# entries in SUPPORTED_EXTENSIONS above; a format listed there but missing here
-# would be handed to PIL and always fail its perceptual hash.
-RAW_EXTENSIONS = {
-    '.raw', '.dng',
-    '.cr2', '.cr3', '.crw',
-    '.nef', '.nrw',
-    '.arw', '.srf', '.sr2',
-    '.raf', '.orf', '.rw2',
-    '.pef', '.ptx', '.srw',
-    '.erf', '.3fr', '.fff',
-    '.iiq', '.mos', '.mrw', '.x3f',
-}
 
 # --- Dependency Check: ExifTool is a HARD requirement (see module docstring
 # for why) — checked here, enforced with a clear fatal error in main(). Two
@@ -463,6 +471,67 @@ def get_db_connection(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def adopt_legacy_database(db_dir: Path) -> Path:
+    """
+    Returns the database path to use, renaming a pre-rename database into
+    place if one is found.
+
+    The file was called photo_hashes.db for the life of the project under its
+    old name. Simply switching DB_FILENAME would have been silently
+    destructive: the engine would find no database, create an empty one, and
+    re-index the entire library from scratch — 25 minutes and 118 GB of
+    network reads for the maintainer's collection, with the previous catalog
+    (including every Completed/Removed_Duplicate audit state proving a file
+    was already migrated) left orphaned on disk under the old name.
+
+    The WAL is checkpointed before the rename. SQLite keeps recently committed
+    pages in <name>-wal until a checkpoint folds them back into the main
+    database; renaming the .db alone would strand that tail, because the
+    reopened database looks for its WAL under the NEW name and never finds the
+    old one. TRUNCATE forces everything into the main file first, after which
+    the sidecars hold nothing worth keeping.
+
+    Safe to call on every startup: it is a no-op once the new name exists, and
+    it runs after the single-instance lock is held, so no other engine process
+    can be mid-write.
+    """
+    db_path = db_dir / DB_FILENAME
+    if db_path.exists():
+        return db_path
+
+    for legacy_name in LEGACY_DB_FILENAMES:
+        legacy_path = db_dir / legacy_name
+        if not legacy_path.exists():
+            continue
+        try:
+            conn = sqlite3.connect(str(legacy_path))
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            finally:
+                conn.close()
+            legacy_path.rename(db_path)
+            for suffix in ("-wal", "-shm"):
+                sidecar = legacy_path.with_name(legacy_path.name + suffix)
+                if sidecar.exists():
+                    sidecar.unlink()
+            logger.info(
+                f"Adopted existing catalog: renamed {legacy_name} to {DB_FILENAME}. "
+                f"Nothing was re-indexed."
+            )
+        except (OSError, sqlite3.Error) as e:
+            # Keep using the legacy file rather than failing the run or
+            # silently starting an empty catalog. The rename is a tidiness
+            # measure; losing the catalog over it would not be.
+            logger.warning(
+                f"Could not rename {legacy_name} to {DB_FILENAME} ({type(e).__name__}: {e}). "
+                f"Continuing with the existing file."
+            )
+            return legacy_path
+        return db_path
+
+    return db_path
+
+
 # --- Database Schema Initialization ---
 def init_database(db_path: str):
     """
@@ -526,6 +595,14 @@ def init_database(db_path: str):
         )
     """)
 
+    conn.commit()
+
+    # Migrations first: a v1 database has no file_size/file_mtime columns yet,
+    # and the covering index below names them. Creating indexes before the
+    # ALTER TABLEs would fail with "no such column" on exactly the databases
+    # the migration exists to upgrade.
+    _migrate_schema(conn)
+
     # Without these, the per-file duplicate check below (one lookup for EVERY
     # file scanned) degrades into a full table scan of a table that is itself
     # growing with every file — quadratic over the size of the library. The
@@ -534,9 +611,24 @@ def init_database(db_path: str):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_sha1 ON photos(sha1_hash)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_status ON photos(status)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_operations_run ON operations(run_id)")
+    # operations is append-only and grows with every file x every run, so
+    # Phase 2's per-photo history panel would scan the whole audit log
+    # without this.
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_operations_photo ON operations(photo_id)")
+    # Change detection on re-index: partition_unchanged() looks up every
+    # candidate by source_path and compares the recorded size/mtime, so the
+    # index has to cover all three columns or the lookup pays a row fetch
+    # per file.
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_photos_source_stat "
+        "ON photos(source_path, file_size, file_mtime)"
+    )
+    # Phase 3 groups photos by perceptual hash on every match-gallery view,
+    # and any "does this image already exist here" question joins on phash.
+    # Unindexed, each of those is a full scan of the whole library.
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_phash ON photos(phash)")
 
     conn.commit()
-    _migrate_schema(conn)
     conn.close()
 
 
@@ -581,14 +673,15 @@ def _migrate_schema(conn: sqlite3.Connection):
         # unchanged file from a changed one without reading it. Existing rows
         # get NULL, which reads as "unknown" and forces one full re-index of
         # that file — correct, and self-correcting after a single pass.
+        # Only the ALTER TABLEs belong here. The covering index over these
+        # columns is created in init_database() alongside every other index:
+        # that block runs on each invocation, so a dropped index heals on the
+        # next run, whereas anything created in this branch happens exactly
+        # once per database and never again.
         existing = {row[1] for row in conn.execute("PRAGMA table_info(photos)")}
         for column, decl in (("file_size", "INTEGER"), ("file_mtime", "REAL")):
             if column not in existing:
                 conn.execute(f"ALTER TABLE photos ADD COLUMN {column} {decl}")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_photos_source_stat "
-            "ON photos(source_path, file_size, file_mtime)"
-        )
         logger.info("Schema migration v1->v2: added change-detection columns to photos.")
 
     conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)};")
@@ -1382,6 +1475,31 @@ def _sha1_of(path: Path) -> Optional[str]:
         return None
 
 
+def _subdir_prefix_clause(subdir: Path) -> tuple:
+    """
+    Builds the (sql_fragment, params) that matches a directory and everything
+    beneath it, with LIKE wildcards in the directory NAME neutralized.
+
+    LIKE treats '_' as "any single character" and '%' as "any sequence", and
+    those are ordinary, common characters in folder names. Interpolating a
+    directory straight into a LIKE pattern therefore widens the match: a run
+    scoped to "My_Photos" would build '/data/source/My_Photos/%', which also
+    matches '/data/source/MyXPhotos/...' — a different folder entirely. For
+    --copy that silently copies files the user did not select; for --move it
+    deletes sources outside the selection, which is unrecoverable.
+
+    Escaping the three special characters and declaring ESCAPE makes the
+    prefix literal. Phase 2 lets users pick arbitrary folders in the web UI,
+    so the engine cannot assume well-behaved names.
+    """
+    literal = str(subdir)
+    escaped = literal.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return (
+        " AND (source_path = ? OR source_path LIKE ? ESCAPE '\\')",
+        [literal, f"{escaped}{os.sep}%"]
+    )
+
+
 def _targeting_predicate(args) -> tuple:
     """
     Returns (sql_fragment, params) narrowing a `photos` query to whatever this
@@ -1399,7 +1517,7 @@ def _targeting_predicate(args) -> tuple:
         return f" AND id IN ({placeholders})", list(args.file_ids)
     if args.source_subdir:
         subdir = (Path(args.source).resolve() / args.source_subdir).resolve()
-        return " AND (source_path = ? OR source_path LIKE ?)", [str(subdir), f"{subdir}{os.sep}%"]
+        return _subdir_prefix_clause(subdir)
     return "", []
 
 
@@ -1869,10 +1987,14 @@ def _query_source_subdir(db_path: str, subdir_filter_path: Path) -> List[str]:
     """
     conn = get_db_connection(db_path)
     placeholders = ','.join('?' * len(SOURCE_CONSUMED_STATUSES))
+    # Same escaped prefix the Move/Copy targeting path uses, so an Index-mode
+    # rescan and the action that follows it can never disagree about which
+    # files "this subdirectory" means.
+    prefix_sql, prefix_params = _subdir_prefix_clause(subdir_filter_path)
     rows = conn.execute(
-        f"SELECT source_path FROM photos WHERE (source_path = ? OR source_path LIKE ?) "
+        f"SELECT source_path FROM photos WHERE 1=1{prefix_sql} "
         f"AND status NOT IN ({placeholders})",
-        (str(subdir_filter_path), f"{subdir_filter_path}{os.sep}%", *SOURCE_CONSUMED_STATUSES)
+        (*prefix_params, *SOURCE_CONSUMED_STATUSES)
     ).fetchall()
     conn.close()
     return [r[0] for r in rows]
@@ -1938,7 +2060,7 @@ def main():
     log_dir = base_dir / "logs"
     db_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
-    db_path = db_dir / "photo_hashes.db"
+    db_path = db_dir / DB_FILENAME
 
     # 2. Configure Logging
     configure_logging(log_dir)
@@ -1954,6 +2076,10 @@ def main():
             f"Wait for it to finish, or cancel it, then retry."
         )
         sys.exit(1)
+
+    # 2a-i. Adopt a pre-rename catalog, if one is here. Must run with the
+    # lock held and before anything opens the database.
+    db_path = adopt_legacy_database(db_dir)
 
     # 2b. ExifTool is a hard requirement (module docstring) — fail fast and
     # clearly, before touching source/dest/the database at all, rather than
@@ -2066,31 +2192,76 @@ def main():
             # one as Failed with a specific reason. Dropping them here (the
             # previous behavior) made a stale selection silently shrink, with
             # nothing in the audit log explaining where those files went.
-            files_to_process = [r[1] for r in rows if r[2] not in SOURCE_CONSUMED_STATUSES]
-            logger.info(f"Targeting {len(files_to_process)} of {len(args.file_ids)} requested file IDs.")
+            candidates = [r[1] for r in rows if r[2] not in SOURCE_CONSUMED_STATUSES]
+            logger.info(f"Targeting {len(candidates)} of {len(args.file_ids)} requested file IDs.")
         elif subdir_filter_path is not None:
             # Same idea as --file-ids: query already-cataloged rows instead of
             # walking the filesystem. Only rows from a prior Index over this
             # path are visible — a fresh subtree needs a full scan first.
-            files_to_process = _query_source_subdir(str(db_path), subdir_filter_path)
-            logger.info(f"Targeting {len(files_to_process)} already-indexed file(s) under source subdirectory.")
+            candidates = _query_source_subdir(str(db_path), subdir_filter_path)
+            logger.info(f"Targeting {len(candidates)} already-indexed file(s) under source subdirectory.")
         else:
-            discovered = discover_source_files(source_path, active_extensions)
-            files_to_process, unchanged = partition_unchanged(
-                str(db_path), discovered, force=args.force_rehash
-            )
+            candidates = discover_source_files(source_path, active_extensions)
             logger.info(
-                f"Discovered {len(discovered):,} supported photo/image files "
+                f"Discovered {len(candidates):,} supported photo/image files "
                 f"(extensions: {', '.join(sorted(active_extensions))})."
             )
-            if unchanged:
-                logger.info(
-                    f"Skipping {len(unchanged):,} unchanged file(s) — size and modification time "
-                    f"still match the catalog, so they are not re-read. "
-                    f"{len(files_to_process):,} file(s) to scan. Pass --force-rehash to re-read everything."
+
+        # A targeting mode that matches nothing is a user-visible mistake, not
+        # a successful no-op. Both targeted modes read the CATALOG rather than
+        # the filesystem, so against a database that has never been indexed
+        # they match zero rows and the run "completes successfully (0 files)"
+        # — indistinguishable from a run that genuinely had nothing to do.
+        # Phase 2 derives job outcome from recorded operations, so such a job
+        # would show green having done nothing at all. Say what happened and
+        # what to do about it.
+        if not candidates:
+            if args.file_ids:
+                logger.warning(
+                    f"None of the {len(args.file_ids)} requested file ID(s) resolved to work for this "
+                    f"run. IDs exist only for files a previous Index recorded, and IDs whose source a "
+                    f"prior --move already consumed are skipped on purpose. Nothing will be "
+                    f"{'copied' if args.copy else 'moved' if args.move else 'scanned'}."
                 )
-            elif args.force_rehash:
-                logger.info("--force-rehash: re-reading every file regardless of the catalog.")
+            elif subdir_filter_path is not None:
+                logger.warning(
+                    f"No indexed files found under {subdir_filter_path}. --source-subdir targets rows "
+                    f"the catalog already holds; it does not walk the filesystem. Run an Index over "
+                    f"this source first (no --file-ids/--source-subdir), then re-run this command. "
+                    f"Nothing will be {'copied' if args.copy else 'moved' if args.move else 'scanned'}."
+                )
+            else:
+                logger.warning(
+                    f"No supported files found under {source_path} "
+                    f"(extensions: {', '.join(sorted(active_extensions))}). Check the source mount "
+                    f"and --exts."
+                )
+
+        # Applies to ALL THREE targeting modes, not just the full scan.
+        #
+        # This used to sit inside the else branch above, so --file-ids and
+        # --source-subdir runs re-read every targeted file in full — SHA-1,
+        # a pixel decode for the perceptual hash, and an ExifTool pass —
+        # even when the catalog already held an identical, current record.
+        # On a real library that meant a scoped --copy of ~9,500 files spent
+        # about seven minutes pulling ~20 GB over the network before the
+        # first byte was copied, recomputing values it already had.
+        #
+        # Those are exactly the runs the web UI issues: the user picks a
+        # folder or a set of files, never "everything". Skipping unchanged
+        # files here is safe because their rows are already Pending with a
+        # resolved dest_path, which is all the Move/Copy phase reads.
+        files_to_process, unchanged = partition_unchanged(
+            str(db_path), candidates, force=args.force_rehash
+        )
+        if unchanged:
+            logger.info(
+                f"Skipping {len(unchanged):,} unchanged file(s) — size and modification time "
+                f"still match the catalog, so they are not re-read. "
+                f"{len(files_to_process):,} file(s) to scan. Pass --force-rehash to re-read everything."
+            )
+        elif args.force_rehash:
+            logger.info("--force-rehash: re-reading every file regardless of the catalog.")
 
         # Submitted in bounded batches rather than all at once. Every
         # completed future holds its ProcessingResult — including the FULL
@@ -2200,9 +2371,23 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
     )
     pending_records = cursor.fetchall()
 
-    total_bytes_needed = sum(
-        Path(src[1]).stat().st_size for src in pending_records if Path(src[1]).exists()
-    )
+    # One stat per file, not two. This used to call exists() and then stat(),
+    # which is two round trips per record on a network share — 52,000 of them
+    # for a 26,000-file pending set, all before any data moves. stat() already
+    # answers both questions, and its failure IS the "missing" case.
+    total_bytes_needed = 0
+    missing = 0
+    for _, candidate_src, _ in pending_records:
+        try:
+            total_bytes_needed += os.stat(candidate_src).st_size
+        except OSError:
+            missing += 1
+    if missing:
+        logger.warning(
+            f"{missing:,} of {len(pending_records):,} pending file(s) could not be stat'd and are "
+            f"excluded from the space estimate. Each will be recorded with its own reason when "
+            f"the loop reaches it."
+        )
 
     if not verify_sufficient_disk_space(dest_path, total_bytes_needed):
         logger.error("Aborting due to insufficient space on destination drive.")
