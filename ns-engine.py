@@ -526,6 +526,14 @@ def init_database(db_path: str):
         )
     """)
 
+    conn.commit()
+
+    # Migrations first: a v1 database has no file_size/file_mtime columns yet,
+    # and the covering index below names them. Creating indexes before the
+    # ALTER TABLEs would fail with "no such column" on exactly the databases
+    # the migration exists to upgrade.
+    _migrate_schema(conn)
+
     # Without these, the per-file duplicate check below (one lookup for EVERY
     # file scanned) degrades into a full table scan of a table that is itself
     # growing with every file — quadratic over the size of the library. The
@@ -534,9 +542,20 @@ def init_database(db_path: str):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_sha1 ON photos(sha1_hash)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_status ON photos(status)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_operations_run ON operations(run_id)")
+    # Change detection on re-index: partition_unchanged() looks up every
+    # candidate by source_path and compares the recorded size/mtime, so the
+    # index has to cover all three columns or the lookup pays a row fetch
+    # per file.
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_photos_source_stat "
+        "ON photos(source_path, file_size, file_mtime)"
+    )
+    # Phase 3 groups photos by perceptual hash on every match-gallery view,
+    # and any "does this image already exist here" question joins on phash.
+    # Unindexed, each of those is a full scan of the whole library.
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_phash ON photos(phash)")
 
     conn.commit()
-    _migrate_schema(conn)
     conn.close()
 
 
@@ -581,14 +600,15 @@ def _migrate_schema(conn: sqlite3.Connection):
         # unchanged file from a changed one without reading it. Existing rows
         # get NULL, which reads as "unknown" and forces one full re-index of
         # that file — correct, and self-correcting after a single pass.
+        # Only the ALTER TABLEs belong here. The covering index over these
+        # columns is created in init_database() alongside every other index:
+        # that block runs on each invocation, so a dropped index heals on the
+        # next run, whereas anything created in this branch happens exactly
+        # once per database and never again.
         existing = {row[1] for row in conn.execute("PRAGMA table_info(photos)")}
         for column, decl in (("file_size", "INTEGER"), ("file_mtime", "REAL")):
             if column not in existing:
                 conn.execute(f"ALTER TABLE photos ADD COLUMN {column} {decl}")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_photos_source_stat "
-            "ON photos(source_path, file_size, file_mtime)"
-        )
         logger.info("Schema migration v1->v2: added change-detection columns to photos.")
 
     conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)};")
