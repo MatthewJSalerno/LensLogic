@@ -127,11 +127,14 @@ Metadata Extraction:
 """
 
 import argparse
+import contextlib
 import errno
 import fcntl
 import hashlib
 import json
 import logging
+import warnings
+import multiprocessing as mp
 import os
 import shutil
 import signal
@@ -161,6 +164,13 @@ DB_QUEUE_SIZE = 1000
 # a stretch, so whichever limit trips first wins.
 DB_COMMIT_BATCH_SIZE = 100
 DB_COMMIT_INTERVAL_SECONDS = 3.0
+
+# How often the scan reports progress. A real 29,000-file library took ~25
+# minutes and printed nothing at all between "Discovered 29047 files" and
+# completion — no way to tell a working run from a wedged one, and no basis for
+# the progress bar Phase 2 needs. Time-based rather than every-N-files so the
+# cadence stays readable whether a library is 200 files or 200,000.
+PROGRESS_INTERVAL_SECONDS = 15.0
 SHA1_CHUNK_SIZE = 65536
 MAX_RETRIES = 3
 INITIAL_RETRY_DELAY = 1.0  # Seconds
@@ -235,6 +245,37 @@ EXIFTOOL_BINARY_AVAILABLE = shutil.which('exiftool') is not None
 EXIFTOOL_SUPPORTED = PYEXIFTOOL_PACKAGE_AVAILABLE and EXIFTOOL_BINARY_AVAILABLE
 
 
+def configure_multiprocessing_start_method() -> str:
+    """
+    Moves worker creation off plain fork(), and returns the method chosen.
+
+    rawpy is built with OpenMP, and an OpenMP runtime that has already started
+    its thread pool does not survive fork() — the child inherits the pool's
+    state without its threads, and the next parallel region can deadlock. rawpy
+    warns about this itself. It is a real hazard, not a lint: the RAW decode
+    path runs inside these workers, so a large library with RAW files is
+    exactly where it would bite, and a deadlock there looks like the scan
+    simply stopping.
+
+    forkserver is preferred over spawn: workers are forked from a small clean
+    template process that never imported rawpy or touched OpenMP, so startup
+    stays cheap while avoiding the unsafe fork. spawn is the fallback for
+    platforms without forkserver (Windows), where it is the only safe option
+    anyway.
+
+    Note this is what makes per-worker logging setup load-bearing rather than
+    belt-and-braces: neither method inherits the parent's handlers, so without
+    the explicit configure_logging() in _init_worker_process every worker-side
+    log line would vanish.
+    """
+    available = mp.get_all_start_methods()
+    for method in ("forkserver", "spawn"):
+        if method in available:
+            mp.set_start_method(method, force=True)
+            return method
+    return mp.get_start_method()
+
+
 # --- Data Models ---
 @dataclass
 class ProcessingResult:
@@ -274,6 +315,14 @@ def configure_logging(log_dir: Path):
     """
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "organizer.log"
+
+    # Route warnings.warn() through logging so they reach organizer.log.
+    # Without this they go straight to stderr and never touch a handler, so a
+    # real library scan showed "Truncated File Read" and rawpy's OpenMP warning
+    # on the console while the log file recorded nothing — the log looked clean
+    # precisely where something was wrong. These matter: a truncated TIFF names
+    # a file worth investigating.
+    logging.captureWarnings(True)
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s [%(levelname)s] (pid:%(process)d/%(threadName)s) %(message)s',
@@ -628,6 +677,8 @@ def db_writer_worker(db_path: str):
     pending_writes = 0
     last_flush = time.monotonic()
     date_sources = {DATE_SOURCE_EXIF: 0, DATE_SOURCE_MTIME: 0}
+    status_counts = {}
+    phash_failures = 0
 
     def flush():
         """
@@ -742,6 +793,9 @@ def db_writer_worker(db_path: str):
             source = result.metadata.get("date_source") if result.metadata else None
             if source in date_sources:
                 date_sources[source] += 1
+            status_counts[status] = status_counts.get(status, 0) + 1
+            if result.phash in ("error", "not_supported"):
+                phash_failures += 1
 
             pending_writes += 1
             if pending_writes >= DB_COMMIT_BATCH_SIZE or (
@@ -764,6 +818,27 @@ def db_writer_worker(db_path: str):
     # so a photo modified late in the evening can land in the next day's folder
     # under a different TZ. Surfacing the count makes that visible per run
     # instead of being something you discover in the organized tree later.
+    # One line that answers "what actually happened?" without reading the whole
+    # log. A real run previously ended with only a file count, so a scan where
+    # hundreds of files failed looked identical to a clean one.
+    total = sum(status_counts.values())
+    if total:
+        breakdown = ", ".join(f"{n:,} {st.lower()}" for st, n in sorted(status_counts.items()))
+        logger.info(f"Index summary: {total:,} file(s) recorded — {breakdown}.")
+        failed = status_counts.get("Failed", 0)
+        if failed:
+            logger.warning(
+                f"{failed:,} file(s) failed and were recorded with a reason — query them with: "
+                f"SELECT source_path, error_message FROM operations "
+                f"WHERE status = 'Failed' AND run_id = (SELECT MAX(id) FROM runs);"
+            )
+        if phash_failures:
+            logger.warning(
+                f"{phash_failures:,} file(s) produced no perceptual hash (undecodable or "
+                f"unsupported format). They are indexed and will move/copy normally, but "
+                f"cannot participate in Phase 3 similarity matching."
+            )
+
     from_exif = date_sources[DATE_SOURCE_EXIF]
     from_mtime = date_sources[DATE_SOURCE_MTIME]
     if from_exif or from_mtime:
@@ -1100,6 +1175,23 @@ def compute_sha1(file_path: str) -> str:
     return retry_io_operation(f"SHA1 Hash {file_path}", _hash)
 
 
+@contextlib.contextmanager
+def warnings_attributed_to(file_path: str):
+    """
+    Captures library warnings raised while decoding one file and re-logs them
+    naming that file.
+
+    PIL's "Truncated File Read" arrives with no indication of WHICH file is
+    truncated — on a 29,000-file library that is an alarm with no address,
+    which is worse than useless. Attaching the path makes it a work item.
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        yield
+    for w in caught:
+        logger.warning(f"{w.category.__name__} decoding {file_path}: {w.message}")
+
+
 def compute_phash(file_path: str) -> str:
     if not IMAGEHASH_SUPPORTED:
         return "not_supported"
@@ -1113,10 +1205,13 @@ def compute_phash(file_path: str) -> str:
         if not (RAWPY_SUPPORTED and PIL_SUPPORTED):
             return "not_supported"
         try:
-            with rawpy.imread(file_path) as raw:
-                rgb = raw.postprocess(use_camera_wb=True, half_size=True, no_auto_bright=True, output_bps=8)
-            img = Image.fromarray(rgb)
-            return str(imagehash.phash(img))
+            with warnings_attributed_to(file_path):
+                with rawpy.imread(file_path) as raw:
+                    rgb = raw.postprocess(
+                        use_camera_wb=True, half_size=True, no_auto_bright=True, output_bps=8
+                    )
+                img = Image.fromarray(rgb)
+                return str(imagehash.phash(img))
         except Exception as e:
             logger.debug(f"rawpy pHash failed for {file_path}: {e}")
             return "error"
@@ -1124,8 +1219,9 @@ def compute_phash(file_path: str) -> str:
     if not PIL_SUPPORTED:
         return "not_supported"
     try:
-        with Image.open(file_path) as img:
-            return str(imagehash.phash(img))
+        with warnings_attributed_to(file_path):
+            with Image.open(file_path) as img:
+                return str(imagehash.phash(img))
     except Exception as e:
         logger.debug(f"PIL pHash failed for {file_path}: {e}")
         return "error"
@@ -1293,6 +1389,28 @@ def copy_verify_delete(source_str: str, dest_str: str, delete_source: bool = Tru
 
 
 # --- Processing Worker ---
+def format_duration(seconds: float) -> str:
+    """Compact human duration: 45s, 12m 30s, 1h 05m."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
+
+
+def log_scan_progress(scanned: int, total: int, started_at: float):
+    """Emits one progress line with rate and a remaining-time estimate."""
+    elapsed = time.monotonic() - started_at
+    rate = scanned / elapsed if elapsed > 0 else 0
+    remaining = (total - scanned) / rate if rate > 0 else 0
+    pct = (scanned / total * 100) if total else 100.0
+    logger.info(
+        f"Progress: {scanned:,} of {total:,} files ({pct:.1f}%) — "
+        f"{rate:.0f} files/sec, about {format_duration(remaining)} remaining."
+    )
+
+
 def _failed_result(file_path_str: str, run_id: int, error_message: str) -> ProcessingResult:
     """Builds the Failed result for a file that could not be scanned at all."""
     return ProcessingResult(
@@ -1545,6 +1663,7 @@ def main():
     )
     args = parser.parse_args()
 
+    start_method = configure_multiprocessing_start_method()
     worker_count = args.workers if args.workers else MAX_WORKER_PROCESSES
     active_extensions = normalize_extensions(args.exts) if args.exts else SUPPORTED_EXTENSIONS
 
@@ -1625,6 +1744,7 @@ def main():
     # conversion happens), but the file-mtime fallback — every file without a
     # usable EXIF date — is interpreted in this zone. A photo taken at 21:00
     # local buckets into the NEXT day under UTC.
+    logger.info(f"Worker start method: {start_method} (avoids unsafe fork with rawpy/OpenMP).")
     _local_now = datetime.now().astimezone()
     logger.info(
         f"Timezone: {_local_now.tzname()} (UTC{_local_now.strftime('%z')}) — "
@@ -1712,6 +1832,8 @@ def main():
         # SIGKILL after ~10s) did nothing at all on a long Index.
         scan_batch_size = max(worker_count * 4, 16)
         scanned = 0
+        scan_started_at = time.monotonic()
+        last_progress_at = scan_started_at
         with ProcessPoolExecutor(
             max_workers=worker_count,
             initializer=_init_worker_process,
@@ -1730,6 +1852,10 @@ def main():
                 for future in futures:
                     put_result(future.result(), db_thread)
                 scanned += len(batch)
+
+                if time.monotonic() - last_progress_at >= PROGRESS_INTERVAL_SECONDS:
+                    log_scan_progress(scanned, len(files_to_process), scan_started_at)
+                    last_progress_at = time.monotonic()
 
         drain_result_queue(db_thread)
         result_queue.put(None)
