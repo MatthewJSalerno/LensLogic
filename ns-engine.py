@@ -1475,6 +1475,31 @@ def _sha1_of(path: Path) -> Optional[str]:
         return None
 
 
+def _subdir_prefix_clause(subdir: Path) -> tuple:
+    """
+    Builds the (sql_fragment, params) that matches a directory and everything
+    beneath it, with LIKE wildcards in the directory NAME neutralized.
+
+    LIKE treats '_' as "any single character" and '%' as "any sequence", and
+    those are ordinary, common characters in folder names. Interpolating a
+    directory straight into a LIKE pattern therefore widens the match: a run
+    scoped to "My_Photos" would build '/data/source/My_Photos/%', which also
+    matches '/data/source/MyXPhotos/...' — a different folder entirely. For
+    --copy that silently copies files the user did not select; for --move it
+    deletes sources outside the selection, which is unrecoverable.
+
+    Escaping the three special characters and declaring ESCAPE makes the
+    prefix literal. Phase 2 lets users pick arbitrary folders in the web UI,
+    so the engine cannot assume well-behaved names.
+    """
+    literal = str(subdir)
+    escaped = literal.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return (
+        " AND (source_path = ? OR source_path LIKE ? ESCAPE '\\')",
+        [literal, f"{escaped}{os.sep}%"]
+    )
+
+
 def _targeting_predicate(args) -> tuple:
     """
     Returns (sql_fragment, params) narrowing a `photos` query to whatever this
@@ -1492,7 +1517,7 @@ def _targeting_predicate(args) -> tuple:
         return f" AND id IN ({placeholders})", list(args.file_ids)
     if args.source_subdir:
         subdir = (Path(args.source).resolve() / args.source_subdir).resolve()
-        return " AND (source_path = ? OR source_path LIKE ?)", [str(subdir), f"{subdir}{os.sep}%"]
+        return _subdir_prefix_clause(subdir)
     return "", []
 
 
@@ -1962,10 +1987,14 @@ def _query_source_subdir(db_path: str, subdir_filter_path: Path) -> List[str]:
     """
     conn = get_db_connection(db_path)
     placeholders = ','.join('?' * len(SOURCE_CONSUMED_STATUSES))
+    # Same escaped prefix the Move/Copy targeting path uses, so an Index-mode
+    # rescan and the action that follows it can never disagree about which
+    # files "this subdirectory" means.
+    prefix_sql, prefix_params = _subdir_prefix_clause(subdir_filter_path)
     rows = conn.execute(
-        f"SELECT source_path FROM photos WHERE (source_path = ? OR source_path LIKE ?) "
+        f"SELECT source_path FROM photos WHERE 1=1{prefix_sql} "
         f"AND status NOT IN ({placeholders})",
-        (str(subdir_filter_path), f"{subdir_filter_path}{os.sep}%", *SOURCE_CONSUMED_STATUSES)
+        (*prefix_params, *SOURCE_CONSUMED_STATUSES)
     ).fetchall()
     conn.close()
     return [r[0] for r in rows]

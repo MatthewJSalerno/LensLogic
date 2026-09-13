@@ -345,6 +345,35 @@ def source_subdir_targeting_is_scoped():
 
 
 @test
+def source_subdir_with_wildcard_chars_is_literal():
+    """--source-subdir: '_' and '%' in a folder name are literal, not LIKE wildcards."""
+    case = new_case("subdirglob")
+    # The prefix match runs through SQL LIKE, where '_' means "any single
+    # character" and '%' means "any sequence". Unescaped, targeting My_Photos
+    # would also sweep in MyXPhotos — copying files the user never selected,
+    # or under --move deleting their sources. Folder names with underscores
+    # are ordinary, and Phase 2 lets users pick arbitrary folders.
+    make_photo(case / "src" / "My_Photos" / "a.jpg", "A")
+    make_photo(case / "src" / "My_Photos" / "nested" / "b.jpg", "B")
+    make_photo(case / "src" / "MyXPhotos" / "c.jpg", "C")
+    make_photo(case / "src" / "100%Done" / "d.jpg", "D")
+    make_photo(case / "src" / "100XDone" / "e.jpg", "E")
+
+    run_engine(case)
+    run_engine(case, "--move", "--source-subdir", "My_Photos")
+
+    remaining = sorted(src_files(case))
+    check(remaining == ["100%Done/d.jpg", "100XDone/e.jpg", "MyXPhotos/c.jpg"],
+          f"'_' was treated as a LIKE wildcard; source still holds {remaining}")
+
+    run_engine(case, "--move", "--source-subdir", "100%Done")
+
+    remaining = sorted(src_files(case))
+    check(remaining == ["100XDone/e.jpg", "MyXPhotos/c.jpg"],
+          f"'%' was treated as a LIKE wildcard; source still holds {remaining}")
+
+
+@test
 def stale_selection_records_a_specific_failure():
     """A targeted file deleted outside the engine is recorded as Failed with a real reason."""
     case = new_case("stale")
