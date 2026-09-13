@@ -319,8 +319,9 @@ def sql_values(statuses) -> str:
 
 
 # Bumped whenever the on-disk schema or the MEANING of a stored value changes.
-# CREATE TABLE IF NOT EXISTS cannot alter an existing table, so anything beyond
-# adding a brand-new table needs a migration step in _migrate_schema().
+# There is no in-place upgrade path: a catalog recording a different version is
+# refused with instructions to delete and re-Index, rather than migrated. See
+# _assert_schema_compatible() for why.
 SCHEMA_VERSION = 3
 
 # --- Dependency Check ---
@@ -628,6 +629,7 @@ def init_database(db_path: str):
       without losing history the way overwriting a column on `photos` would.
     """
     conn = get_db_connection(db_path)
+    _assert_schema_compatible(conn, db_path)
     cursor = conn.cursor()
     cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS photos (
@@ -679,12 +681,6 @@ def init_database(db_path: str):
 
     conn.commit()
 
-    # Migrations first: a v1 database has no file_size/file_mtime columns yet,
-    # and the covering index below names them. Creating indexes before the
-    # ALTER TABLEs would fail with "no such column" on exactly the databases
-    # the migration exists to upgrade.
-    _migrate_schema(conn)
-
     # Without these, the per-file duplicate check below (one lookup for EVERY
     # file scanned) degrades into a full table scan of a table that is itself
     # growing with every file — quadratic over the size of the library. The
@@ -710,188 +706,56 @@ def init_database(db_path: str):
     # Unindexed, each of those is a full scan of the whole library.
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_photos_phash ON photos(phash)")
 
+    conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)};")
     conn.commit()
     conn.close()
 
 
-def _migrate_schema(conn: sqlite3.Connection):
+class SchemaVersionError(Exception):
+    """Raised when the catalog on disk was written by a different schema version."""
+
+
+def _assert_schema_compatible(conn: sqlite3.Connection, db_path: str):
     """
-    Applies any pending schema/data migrations, tracked via PRAGMA
-    user_version (SQLite's built-in per-database integer, untouched by
-    anything else). A fresh database starts at 0 and every migration below
-    is a harmless no-op against empty tables, so new and existing databases
-    both land on SCHEMA_VERSION by the same path.
+    Refuses to open a catalog written by a different schema version.
+
+    There is deliberately NO migration machinery. This engine is pre-release,
+    the catalog is a derived artifact — every value in it is recomputable from
+    the source files by re-running an Index — and migration code is the worst
+    kind of complexity to carry: it runs rarely, on real user data, along a
+    path that is almost never exercised. The previous version of this file
+    carried three migration branches, and one of them had a latent bug that
+    survived until someone read it closely: an index created only inside a
+    migration step, and therefore unrecoverable on any database that had
+    already passed that version.
+
+    Rebuilding costs one Index run. Silently operating on a catalog whose
+    shape the code no longer matches costs correctness, and does so without
+    any symptom until something downstream reads a column that is not there
+    or a status the constraint would have rejected.
+
+    A fresh database (no tables yet) is fine at any recorded version — that is
+    just an empty file. Anything else must match exactly.
     """
-    current = conn.execute("PRAGMA user_version;").fetchone()[0]
-    if current >= SCHEMA_VERSION:
+    has_tables = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('photos','runs','operations')"
+    ).fetchone()[0] > 0
+    if not has_tables:
         return
 
-    if current < 1:
-        # v0 -> v1: runs.file_ids_filter changed from a bare JSON array
-        # ("[1,2,3]") to a self-describing object ('{"file_ids": [1,2,3]}')
-        # when --source-subdir targeting was added and the column had to
-        # express which of two mechanisms scoped the run. Databases written
-        # before that change still hold the array form; rewrite them so
-        # readers only ever have to understand one shape.
-        migrated = 0
-        for run_id, raw in conn.execute(
-            "SELECT id, file_ids_filter FROM runs WHERE file_ids_filter IS NOT NULL"
-        ).fetchall():
-            try:
-                parsed = json.loads(raw)
-            except (TypeError, ValueError):
-                continue
-            if isinstance(parsed, list):
-                conn.execute(
-                    "UPDATE runs SET file_ids_filter = ? WHERE id = ?",
-                    (json.dumps({"file_ids": parsed}), run_id)
-                )
-                migrated += 1
-        if migrated:
-            logger.info(f"Schema migration v0->v1: rewrote {migrated} legacy run targeting filter(s).")
+    found = conn.execute("PRAGMA user_version;").fetchone()[0]
+    if found == SCHEMA_VERSION:
+        return
 
-    if current < 2:
-        # v1 -> v2: file_size and file_mtime, so a re-index can tell an
-        # unchanged file from a changed one without reading it. Existing rows
-        # get NULL, which reads as "unknown" and forces one full re-index of
-        # that file — correct, and self-correcting after a single pass.
-        # Only the ALTER TABLEs belong here. The covering index over these
-        # columns is created in init_database() alongside every other index:
-        # that block runs on each invocation, so a dropped index heals on the
-        # next run, whereas anything created in this branch happens exactly
-        # once per database and never again.
-        existing = {row[1] for row in conn.execute("PRAGMA table_info(photos)")}
-        for column, decl in (("file_size", "INTEGER"), ("file_mtime", "REAL")):
-            if column not in existing:
-                conn.execute(f"ALTER TABLE photos ADD COLUMN {column} {decl}")
-        logger.info("Schema migration v1->v2: added change-detection columns to photos.")
-
-    if current < 3:
-        # v2 -> v3: CHECK constraints on every status column.
-        #
-        # SQLite has no ALTER TABLE ADD CONSTRAINT, so each table is rebuilt
-        # under its new definition and its rows copied across. That is the
-        # documented procedure, and it is safe here because DDL participates
-        # in the surrounding transaction: either every table ends up
-        # constrained with all its rows, or nothing changes.
-        #
-        # Existing data is validated BEFORE any rebuild starts. A row holding
-        # a value outside the vocabulary would otherwise fail the copy
-        # partway through with a constraint error naming no row, which is a
-        # miserable thing to debug on someone's real catalog. Checking first
-        # means the engine can name the offending values and leave the
-        # database exactly as it found it.
-        offenders = []
-        for table, allowed, nullable in (
-            ("photos", PHOTO_STATUSES, True),
-            ("runs", RUN_STATUSES, False),
-            ("operations", OPERATION_STATUSES, False),
-        ):
-            if not conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
-            ).fetchone():
-                continue
-            null_clause = " AND status IS NOT NULL" if nullable else ""
-            rows = conn.execute(
-                f"SELECT DISTINCT status FROM {table} "
-                f"WHERE status NOT IN ({sql_values(allowed)}){null_clause}"
-            ).fetchall()
-            offenders.extend((table, r[0]) for r in rows)
-
-        if offenders:
-            detail = ", ".join(f"{t}.status={v!r}" for t, v in offenders)
-            raise sqlite3.IntegrityError(
-                "Cannot apply schema v3: the catalog holds status values outside the known "
-                f"vocabulary ({detail}). This means something wrote a status this engine does "
-                "not recognise. The database has NOT been modified. Correct or remove those "
-                "rows, then re-run."
-            )
-
-        # photos: column list is spelled out rather than using SELECT *, so a
-        # column added later cannot silently change the copy's meaning.
-        conn.execute(f"""
-            CREATE TABLE photos_v3 (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_path TEXT UNIQUE,
-                dest_path TEXT,
-                sha1_hash TEXT,
-                phash TEXT,
-                collision_group INTEGER,
-                is_master BOOLEAN DEFAULT 0,
-                status TEXT,
-                metadata_json TEXT,
-                has_name_collision BOOLEAN DEFAULT 0,
-                file_size INTEGER,
-                file_mtime REAL,
-                CHECK (status IS NULL OR status IN ({sql_values(PHOTO_STATUSES)}))
-            )
-        """)
-        conn.execute(
-            "INSERT INTO photos_v3 (id, source_path, dest_path, sha1_hash, phash, collision_group, "
-            "is_master, status, metadata_json, has_name_collision, file_size, file_mtime) "
-            "SELECT id, source_path, dest_path, sha1_hash, phash, collision_group, is_master, "
-            "status, metadata_json, has_name_collision, file_size, file_mtime FROM photos"
-        )
-        conn.execute("DROP TABLE photos")
-        conn.execute("ALTER TABLE photos_v3 RENAME TO photos")
-
-        conn.execute(f"""
-            CREATE TABLE runs_v3 (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                mode TEXT NOT NULL,
-                source_path TEXT,
-                dest_path TEXT,
-                file_ids_filter TEXT,
-                started_at TEXT NOT NULL,
-                ended_at TEXT,
-                status TEXT NOT NULL,
-                CHECK (status IN ({sql_values(RUN_STATUSES)}))
-            )
-        """)
-        conn.execute(
-            "INSERT INTO runs_v3 (id, mode, source_path, dest_path, file_ids_filter, started_at, "
-            "ended_at, status) SELECT id, mode, source_path, dest_path, file_ids_filter, "
-            "started_at, ended_at, status FROM runs"
-        )
-        conn.execute("DROP TABLE runs")
-        conn.execute("ALTER TABLE runs_v3 RENAME TO runs")
-
-        conn.execute(f"""
-            CREATE TABLE operations_v3 (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id INTEGER NOT NULL,
-                photo_id INTEGER,
-                original_filename TEXT,
-                source_path TEXT,
-                dest_path TEXT,
-                status TEXT NOT NULL,
-                error_message TEXT,
-                has_name_collision BOOLEAN DEFAULT 0,
-                timestamp TEXT NOT NULL,
-                CHECK (status IN ({sql_values(OPERATION_STATUSES)})),
-                FOREIGN KEY(run_id) REFERENCES runs(id),
-                FOREIGN KEY(photo_id) REFERENCES photos(id)
-            )
-        """)
-        conn.execute(
-            "INSERT INTO operations_v3 (id, run_id, photo_id, original_filename, source_path, "
-            "dest_path, status, error_message, has_name_collision, timestamp) "
-            "SELECT id, run_id, photo_id, original_filename, source_path, dest_path, status, "
-            "error_message, has_name_collision, timestamp FROM operations"
-        )
-        conn.execute("DROP TABLE operations")
-        conn.execute("ALTER TABLE operations_v3 RENAME TO operations")
-
-        # DROP TABLE takes the old indexes with it. init_database() recreates
-        # them immediately after this function returns, which is why they live
-        # in that idempotent block rather than here.
-        logger.info(
-            "Schema migration v2->v3: status columns are now constrained to their known "
-            "vocabularies."
-        )
-
-    conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)};")
-    conn.commit()
+    conn.close()
+    raise SchemaVersionError(
+        f"The catalog at {db_path} was written by schema version {found}, but this engine "
+        f"expects version {SCHEMA_VERSION}. There is no in-place upgrade: the catalog is "
+        f"rebuildable from your source files, so delete it and run an Index to recreate it. "
+        f"Nothing in --source or --dest is touched by deleting the catalog, but any record of "
+        f"which files a previous --move already migrated is lost with it — so if a --move has "
+        f"run against this catalog, move the old file aside rather than deleting it."
+    )
 
 
 def start_run(
@@ -2360,12 +2224,10 @@ def main():
     # 3. Schema + Startup Recovery
     try:
         init_database(str(db_path))
-    except sqlite3.IntegrityError as e:
-        # Raised by the v2->v3 migration when the catalog holds a status value
-        # outside the known vocabulary. The database is untouched; surface it
-        # the way the other fatal startup conditions are surfaced rather than
-        # as a traceback, since the message already names the problem and the
-        # remedy.
+    except SchemaVersionError as e:
+        # The catalog predates this engine's schema. The message names the
+        # remedy; surface it the way the other fatal startup conditions are
+        # surfaced rather than as a traceback.
         logger.error(f"FATAL: {e}")
         release_single_instance_lock(lock_fd)
         sys.exit(1)

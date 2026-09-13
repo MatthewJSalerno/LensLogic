@@ -321,7 +321,11 @@ The general principle: the engine guarantees it will never act on something it h
 
 ### 6.1 SQLite Schema
 
-Schema changes are versioned with SQLite's built-in `PRAGMA user_version` and applied by the engine on startup (`_migrate_schema`), since `CREATE TABLE IF NOT EXISTS` cannot alter an existing table. **The API layer should not migrate the schema itself** — it opens a database the engine has already brought up to date, and two writers racing migrations on the same file is exactly the kind of thing the single-instance lock exists to prevent. Read `PRAGMA user_version` if the API needs to assert a minimum schema version before serving.
+Schema changes are versioned with SQLite's built-in `PRAGMA user_version`, but **there is no in-place upgrade path and none should be added**. The catalog is a derived artifact — every value in it is recomputable from the source files by running an Index — so a catalog recording a different version is refused at startup with instructions to delete and rebuild, rather than migrated. Migration code runs rarely, on real user data, along a path that is almost never exercised; the engine previously carried three migration branches and one had a latent bug that survived until someone read it closely.
+
+**The API layer should not create or alter the schema.** It opens a database the engine owns. It should read `PRAGMA user_version` on startup and refuse to serve if it does not match the version it was built against, surfacing "run a Scan to rebuild the catalog" rather than querying a shape it does not understand. Two writers disagreeing about schema on the same file is exactly what the single-instance lock exists to prevent.
+
+Note the asymmetry this creates for the UI: deleting the catalog is cheap for Index state, but it discards the record of which files a previous Move already migrated. Where the UI offers a rebuild, it should say so.
 
 The schema below reflects what's actually implemented in `ns-engine.py`, not a set of `ALTER TABLE` additions on top of the original `photos` table. Error tracking, name-collision flags, and original filenames live in a dedicated **audit log table** rather than as columns bolted onto `photos` — see the design note below for why.
 
@@ -367,11 +371,9 @@ CREATE TABLE runs (
                             -- targeting mechanism scoped the run:
                             --   {"file_ids": [101, 102]}
                             --   {"source_subdir": "sd_card/day1"}
-                            -- NULL for a full directory scan. (Databases
-                            -- written before --source-subdir existed stored a
-                            -- bare JSON array here; the v0->v1 migration
-                            -- rewrites those, so readers only ever see the
-                            -- object form. Column name kept for compatibility.)
+                            -- NULL for a full directory scan. Always the
+                            -- object form; the column name predates
+                            -- --source-subdir and is kept as-is.
     started_at TEXT NOT NULL,
     ended_at TEXT,
     status TEXT NOT NULL    -- Running, Completed, Cancelled, Failed, Crashed

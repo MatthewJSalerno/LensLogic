@@ -752,8 +752,8 @@ def status_columns_are_constrained():
     # this column, so the database has to enforce the vocabulary itself.
     conn = db(case)
     try:
-        check(conn.execute("PRAGMA user_version").fetchone()[0] >= 3,
-              "schema did not reach v3")
+        check(conn.execute("PRAGMA user_version").fetchone()[0] == 3,
+              "schema version stamp is wrong")
 
         for sql, params, label in (
             ("INSERT INTO photos (source_path, status) VALUES ('/typo.jpg', ?)",
