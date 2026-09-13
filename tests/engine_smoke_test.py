@@ -255,6 +255,21 @@ def exact_duplicate_removed_only_with_verified_copy():
     check(len(dest_files(case)) == 1, f"only one physical copy should remain: {dest_files(case)}")
     check(src_files(case) == [], f"source should be empty, left {src_files(case)}")
 
+    # Every row — the surviving copy AND each duplicate — must point at a file
+    # that actually exists. A duplicate keeps the destination projected for it
+    # at Index time under its own filename, which is never written; left
+    # uncorrected the record describes a phantom, which is useless exactly when
+    # it matters: "this was a duplicate, so where did its content end up?"
+    for r in rows(case, "SELECT source_path, status, dest_path FROM photos"):
+        check(r["dest_path"] and Path(r["dest_path"]).exists(),
+              f"{Path(r['source_path']).name} ({r['status']}) points at a file that does not "
+              f"exist: {r['dest_path']}")
+
+    # ...and every member of the group is reachable from its sha1.
+    group = rows(case, "SELECT sha1_hash, COUNT(*) n FROM photos GROUP BY sha1_hash")
+    check(len(group) == 1 and group[0]["n"] == 2,
+          f"both copies should share one sha1 group, got {group}")
+
 
 @test
 def copy_is_non_destructive_and_idempotent():

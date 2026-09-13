@@ -1878,6 +1878,37 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
         if duplicate_records:
             logger.info(f"Duplicate cleanup: removed {removed_count} of {len(duplicate_records)} flagged duplicates.")
 
+    # Point every duplicate at the copy that actually exists.
+    #
+    # A Duplicate row keeps the dest_path projected for it at Index time — a
+    # path under its OWN filename that is never written, because only Pending
+    # rows are copied. The row therefore described a file that does not exist,
+    # which is useless precisely when it matters: answering "this source file
+    # was a duplicate, so where did its content actually end up?"
+    #
+    # Rewriting it to the surviving copy's real path makes each duplicate
+    # record a usable pointer. The group is already queryable by sha1_hash;
+    # this makes each member individually answerable too. Runs after the
+    # move/copy loop and duplicate cleanup, so the anchor's dest_path is final
+    # (collision suffixes included) rather than still a projection.
+    if not was_cancelled:
+        cursor.execute(
+            "UPDATE photos SET dest_path = ("
+            "    SELECT anchor.dest_path FROM photos AS anchor"
+            "     WHERE anchor.sha1_hash = photos.sha1_hash"
+            "       AND anchor.status IN ('Completed', 'Copied')"
+            "     LIMIT 1)"
+            " WHERE status IN ('Duplicate', 'Removed_Duplicate')"
+            "   AND EXISTS ("
+            "    SELECT 1 FROM photos AS anchor"
+            "     WHERE anchor.sha1_hash = photos.sha1_hash"
+            "       AND anchor.status IN ('Completed', 'Copied'))" + predicate,
+            predicate_params
+        )
+        if cursor.rowcount:
+            logger.info(f"Repointed {cursor.rowcount} duplicate record(s) at the verified copy they match.")
+        conn.commit()
+
     conn.close()
 
     if was_cancelled:
