@@ -1015,6 +1015,17 @@ def parse_exif_date(value: str) -> Optional[datetime]:
 # difference that compounds across a large library.
 _worker_exiftool: Optional["pyexiftool.ExifToolHelper"] = None
 
+# Consecutive ExifTool failures in this worker. The self-healing respawn below
+# is worth doing for a one-off bad file, but repeating it forever is not: if
+# ExifTool is broken in this process rather than confused by one image, every
+# subsequent file pays a terminate-and-respawn — silently, since the failure
+# was logged at DEBUG. That cost a real library run 4.75 seconds PER FILE with
+# the CPU almost idle (112% of 2400% available) and not one line in the log to
+# explain it. After this many consecutive failures the worker stops trying and
+# falls through to the PIL path, which is the documented fallback anyway.
+_worker_exiftool_failures = 0
+MAX_CONSECUTIVE_EXIFTOOL_FAILURES = 3
+
 
 def _init_worker_process(exiftool_supported: bool, log_dir: Optional[str] = None):
     """
@@ -1088,26 +1099,53 @@ def get_full_exif_via_exiftool(file_path: Path) -> Optional[dict]:
     Uses this worker process's persistent ExifTool instance (see
     _init_worker_process) instead of spawning a subprocess per file.
     """
-    global _worker_exiftool
+    global _worker_exiftool, _worker_exiftool_failures
     if _worker_exiftool is None:
         return None
     try:
         result = _worker_exiftool.get_metadata([str(file_path)])
         if result and isinstance(result, list):
+            _worker_exiftool_failures = 0   # consecutive, not cumulative
             return result[0]
     except Exception as e:
-        logger.debug(f"ExifTool (persistent) extraction failed for {file_path.name}: {e}")
-        # Self-healing: if the persistent subprocess itself died or got into
-        # a bad state (e.g. choked on a malformed file), don't silently lose
-        # ExifTool capability for every remaining file this worker handles —
-        # replace it with a fresh instance and let the NEXT file try again.
+        _worker_exiftool_failures += 1
+
+        # WARNING, not DEBUG. This path costs a process teardown and respawn
+        # per file; a run that silently spends seconds per file on it looks
+        # like a mysteriously slow scan with a clean log, which is exactly how
+        # it presented on a real library.
+        logger.warning(
+            f"ExifTool extraction failed for {file_path.name} "
+            f"(failure {_worker_exiftool_failures} of {MAX_CONSECUTIVE_EXIFTOOL_FAILURES} "
+            f"before this worker gives up on it): {e}"
+        )
+
         try:
-            _worker_exiftool.terminate()
+            # Bounded. PyExifTool's terminate() waits up to 30s by default,
+            # which is indistinguishable from a hang when it happens per file.
+            try:
+                _worker_exiftool.terminate(timeout=5)
+            except TypeError:
+                _worker_exiftool.terminate()
         except Exception:
             pass
+
+        if _worker_exiftool_failures >= MAX_CONSECUTIVE_EXIFTOOL_FAILURES:
+            # Broken in this process, not confused by one file. Stop paying the
+            # respawn on every remaining file and use the PIL fallback.
+            logger.error(
+                f"ExifTool has failed {_worker_exiftool_failures} times consecutively in this "
+                f"worker — disabling it here and falling back to PIL for metadata. Dates and "
+                f"camera details will still be read where PIL can supply them, but the full tag "
+                f"set will be missing and RAW files cannot be read at all."
+            )
+            _worker_exiftool = None
+            return None
+
         try:
             _worker_exiftool = pyexiftool.ExifToolHelper(common_args=[])
-        except Exception:
+        except Exception as spawn_error:
+            logger.error(f"Could not restart ExifTool in this worker: {spawn_error}")
             _worker_exiftool = None
     return None
 
