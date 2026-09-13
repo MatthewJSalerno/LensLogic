@@ -412,6 +412,34 @@ def targeted_runs_skip_unchanged_files():
 
 
 @test
+def targeting_nothing_says_why():
+    """A scoped run against an un-indexed catalog explains itself instead of quietly succeeding."""
+    case = new_case("emptytarget")
+    make_photo(case / "src" / "day1" / "a.jpg", "A")
+
+    # No Index has ever run, so the catalog is empty. Both targeted modes read
+    # the catalog rather than the filesystem, so they match nothing — and the
+    # run would otherwise report "completed successfully (0 files)", which is
+    # indistinguishable from having had nothing to do.
+    out = engine_output(run_engine(case, "--copy", "--source-subdir", "day1"))
+    check("No indexed files found" in out,
+          f"a scoped copy against an empty catalog did not explain itself; log said:\n{out}")
+    check("Run an Index over this source first" in out,
+          f"the warning did not say how to fix it; log said:\n{out}")
+
+    out = engine_output(run_engine(case, "--copy", "--file-ids", "1,2,3"))
+    check("did not resolve to work for this run" in out,
+          f"an unresolvable --file-ids selection did not explain itself; log said:\n{out}")
+
+    # And once indexed, the same scoped command finds its file.
+    run_engine(case)
+    out = engine_output(run_engine(case, "--copy", "--source-subdir", "day1"))
+    check("No indexed files found" not in out,
+          f"scoped copy still reported an empty target after indexing; log said:\n{out}")
+    check((case / "dest").exists(), "scoped copy produced no destination tree after indexing")
+
+
+@test
 def stale_selection_records_a_specific_failure():
     """A targeted file deleted outside the engine is recorded as Failed with a real reason."""
     case = new_case("stale")

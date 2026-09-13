@@ -2207,6 +2207,36 @@ def main():
                 f"(extensions: {', '.join(sorted(active_extensions))})."
             )
 
+        # A targeting mode that matches nothing is a user-visible mistake, not
+        # a successful no-op. Both targeted modes read the CATALOG rather than
+        # the filesystem, so against a database that has never been indexed
+        # they match zero rows and the run "completes successfully (0 files)"
+        # — indistinguishable from a run that genuinely had nothing to do.
+        # Phase 2 derives job outcome from recorded operations, so such a job
+        # would show green having done nothing at all. Say what happened and
+        # what to do about it.
+        if not candidates:
+            if args.file_ids:
+                logger.warning(
+                    f"None of the {len(args.file_ids)} requested file ID(s) resolved to work for this "
+                    f"run. IDs exist only for files a previous Index recorded, and IDs whose source a "
+                    f"prior --move already consumed are skipped on purpose. Nothing will be "
+                    f"{'copied' if args.copy else 'moved' if args.move else 'scanned'}."
+                )
+            elif subdir_filter_path is not None:
+                logger.warning(
+                    f"No indexed files found under {subdir_filter_path}. --source-subdir targets rows "
+                    f"the catalog already holds; it does not walk the filesystem. Run an Index over "
+                    f"this source first (no --file-ids/--source-subdir), then re-run this command. "
+                    f"Nothing will be {'copied' if args.copy else 'moved' if args.move else 'scanned'}."
+                )
+            else:
+                logger.warning(
+                    f"No supported files found under {source_path} "
+                    f"(extensions: {', '.join(sorted(active_extensions))}). Check the source mount "
+                    f"and --exts."
+                )
+
         # Applies to ALL THREE targeting modes, not just the full scan.
         #
         # This used to sit inside the else branch above, so --file-ids and
