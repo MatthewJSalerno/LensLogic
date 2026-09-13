@@ -358,10 +358,16 @@ def unreadable_file_does_not_abort_the_scan():
         indexed = rows(case, "SELECT status FROM photos")
         check(len(indexed) == 5, f"expected all 5 files recorded, got {len(indexed)}")
         check(status_of(case, "bad.jpg") == "Failed", "unreadable file should be Failed")
+        # Match on the FILENAME, not a substring of the full path: the
+        # workspace prefix "ns-smoke-" itself contains "ok", so `"ok" in
+        # source_path` matched every row — including bad.jpg — and asserted
+        # the deliberately-unreadable file should be Pending.
         oks = [r for r in rows(case, "SELECT source_path, status FROM photos")
-               if "ok" in r["source_path"]]
+               if Path(r["source_path"]).name.startswith("ok")]
+        check(len(oks) == 4, f"expected 4 readable files, matched {len(oks)}")
         check(all(r["status"] == "Pending" for r in oks),
-              "readable files should still be indexed normally")
+              f"readable files should still be indexed normally: "
+              f"{[(Path(r['source_path']).name, r['status']) for r in oks]}")
     finally:
         bad.chmod(0o644)
 
