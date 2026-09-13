@@ -1515,6 +1515,19 @@ def main():
     logger.info(f"Source Directory: {source_path}")
     logger.info(f"Destination Directory: {dest_path}")
     logger.info(f"Database Path: {db_path}")
+
+    # Log the resolved timezone explicitly: it silently decides which
+    # YYYY/MM/DD folder a file lands in, and a container defaults to UTC
+    # regardless of the host's zone unless TZ is passed in. EXIF dates are
+    # used exactly as the camera recorded them (they carry no zone, so no
+    # conversion happens), but the file-mtime fallback — every file without a
+    # usable EXIF date — is interpreted in this zone. A photo taken at 21:00
+    # local buckets into the NEXT day under UTC.
+    _local_now = datetime.now().astimezone()
+    logger.info(
+        f"Timezone: {_local_now.tzname()} (UTC{_local_now.strftime('%z')}) — "
+        f"used for date bucketing when a file has no EXIF date. Pass -e TZ=<zone> to change it."
+    )
     if args.file_ids:
         logger.info(f"Targeted file IDs: {args.file_ids}")
     if subdir_filter_path is not None:

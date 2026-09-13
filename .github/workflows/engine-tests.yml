@@ -1,0 +1,49 @@
+name: Engine tests
+
+# The engine's only coverage is tests/engine_smoke_test.py, and it requires
+# ExifTool, Pillow, rawpy and imagehash — which is exactly what the image
+# provides. Running it here rather than relying on someone remembering keeps it
+# from rotting once Phase 2 adds a second codebase to the repo.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: Smoke suite (in container)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Also the only automated check that the Dockerfile itself still builds.
+      - name: Build image
+        run: docker build -t negativespace .
+
+      - name: Engine starts and parses its CLI
+        run: docker run --rm negativespace python3 ns-engine.py --help
+
+      - name: Timezone database is present
+        # Without tzdata, -e TZ=<zone> is silently ignored and the container
+        # stays on UTC — which quietly changes date bucketing. Assert the
+        # variable actually takes effect rather than trusting that it does.
+        run: |
+          tz=$(docker run --rm -e TZ=America/New_York --entrypoint date negativespace +%Z)
+          echo "container reports TZ=$tz"
+          if [ "$tz" = "UTC" ]; then
+            echo "::error::TZ was ignored — tzdata is missing from the image"
+            exit 1
+          fi
+
+      - name: Smoke suite
+        # PUID/PGID drop privileges, which is what lets the permission test run
+        # at all — as root it skips, and a test that always skips is
+        # indistinguishable from one that passes.
+        run: |
+          docker run --rm \
+            -e PUID=$(id -u) -e PGID=$(id -g) \
+            -v "$PWD":/app -w /app \
+            negativespace python3 tests/engine_smoke_test.py
