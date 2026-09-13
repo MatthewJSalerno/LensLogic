@@ -127,11 +127,14 @@ Metadata Extraction:
 """
 
 import argparse
+import contextlib
 import errno
 import fcntl
 import hashlib
 import json
 import logging
+import warnings
+import multiprocessing as mp
 import os
 import shutil
 import signal
@@ -161,10 +164,42 @@ DB_QUEUE_SIZE = 1000
 # a stretch, so whichever limit trips first wins.
 DB_COMMIT_BATCH_SIZE = 100
 DB_COMMIT_INTERVAL_SECONDS = 3.0
+
+# How often the scan reports progress. A real 29,000-file library took ~25
+# minutes and printed nothing at all between "Discovered 29047 files" and
+# completion — no way to tell a working run from a wedged one, and no basis for
+# the progress bar Phase 2 needs. Time-based rather than every-N-files so the
+# cadence stays readable whether a library is 200 files or 200,000.
+PROGRESS_INTERVAL_SECONDS = 15.0
 SHA1_CHUNK_SIZE = 65536
 MAX_RETRIES = 3
 INITIAL_RETRY_DELAY = 1.0  # Seconds
-SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.tiff', '.raw', '.dng', '.cr2', '.nef', '.arw', '.raf'}
+# Extensions scanned by default. A missing entry is worse than a failure: the
+# file is not indexed, not counted, not reported — it is simply invisible, and
+# you find out when it is still sitting in the source folder after an organize
+# pass. '.tif' was absent while '.tiff' was present, which silently skipped
+# every TIFF written by the more common spelling.
+SUPPORTED_EXTENSIONS = {
+    # Common raster
+    '.jpg', '.jpeg', '.jpe', '.jfif', '.png', '.gif', '.bmp', '.webp',
+    '.tif', '.tiff', '.heic', '.heif', '.avif',
+    # RAW, by vendor
+    '.raw', '.dng',           # generic / Adobe
+    '.cr2', '.cr3', '.crw',   # Canon
+    '.nef', '.nrw',           # Nikon
+    '.arw', '.srf', '.sr2',   # Sony
+    '.raf',                   # Fujifilm
+    '.orf',                   # Olympus
+    '.rw2',                   # Panasonic
+    '.pef', '.ptx',           # Pentax
+    '.srw',                   # Samsung
+    '.erf',                   # Epson
+    '.3fr', '.fff',           # Hasselblad
+    '.iiq',                   # Phase One
+    '.mos',                   # Leaf
+    '.mrw',                   # Minolta
+    '.x3f',                   # Sigma
+}
 PARTIAL_SUFFIX = ".organizing.partial"
 LOCK_FILENAME = "engine.lock"
 
@@ -185,7 +220,7 @@ DATE_SOURCE_MTIME = "file_mtime"
 # Bumped whenever the on-disk schema or the MEANING of a stored value changes.
 # CREATE TABLE IF NOT EXISTS cannot alter an existing table, so anything beyond
 # adding a brand-new table needs a migration step in _migrate_schema().
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # --- Dependency Check ---
 try:
@@ -218,7 +253,20 @@ try:
 except ImportError:
     RAWPY_SUPPORTED = False
 
-RAW_EXTENSIONS = {'.raw', '.dng', '.cr2', '.nef', '.arw', '.raf'}
+# Formats that need rawpy/LibRaw to decode — PIL cannot open these at all, so
+# compute_phash() must route them to the RAW branch. Kept in sync with the RAW
+# entries in SUPPORTED_EXTENSIONS above; a format listed there but missing here
+# would be handed to PIL and always fail its perceptual hash.
+RAW_EXTENSIONS = {
+    '.raw', '.dng',
+    '.cr2', '.cr3', '.crw',
+    '.nef', '.nrw',
+    '.arw', '.srf', '.sr2',
+    '.raf', '.orf', '.rw2',
+    '.pef', '.ptx', '.srw',
+    '.erf', '.3fr', '.fff',
+    '.iiq', '.mos', '.mrw', '.x3f',
+}
 
 # --- Dependency Check: ExifTool is a HARD requirement (see module docstring
 # for why) — checked here, enforced with a clear fatal error in main(). Two
@@ -233,6 +281,37 @@ except ImportError:
 
 EXIFTOOL_BINARY_AVAILABLE = shutil.which('exiftool') is not None
 EXIFTOOL_SUPPORTED = PYEXIFTOOL_PACKAGE_AVAILABLE and EXIFTOOL_BINARY_AVAILABLE
+
+
+def configure_multiprocessing_start_method() -> str:
+    """
+    Moves worker creation off plain fork(), and returns the method chosen.
+
+    rawpy is built with OpenMP, and an OpenMP runtime that has already started
+    its thread pool does not survive fork() — the child inherits the pool's
+    state without its threads, and the next parallel region can deadlock. rawpy
+    warns about this itself. It is a real hazard, not a lint: the RAW decode
+    path runs inside these workers, so a large library with RAW files is
+    exactly where it would bite, and a deadlock there looks like the scan
+    simply stopping.
+
+    forkserver is preferred over spawn: workers are forked from a small clean
+    template process that never imported rawpy or touched OpenMP, so startup
+    stays cheap while avoiding the unsafe fork. spawn is the fallback for
+    platforms without forkserver (Windows), where it is the only safe option
+    anyway.
+
+    Note this is what makes per-worker logging setup load-bearing rather than
+    belt-and-braces: neither method inherits the parent's handlers, so without
+    the explicit configure_logging() in _init_worker_process every worker-side
+    log line would vanish.
+    """
+    available = mp.get_all_start_methods()
+    for method in ("forkserver", "spawn"):
+        if method in available:
+            mp.set_start_method(method, force=True)
+            return method
+    return mp.get_start_method()
 
 
 # --- Data Models ---
@@ -250,6 +329,8 @@ class ProcessingResult:
     collision_group: Optional[int] = None
     is_master: bool = False
     error_message: Optional[str] = None
+    file_size: int = 0
+    file_mtime: float = 0.0
 
 
 # --- Producer-Consumer Queue ---
@@ -274,6 +355,14 @@ def configure_logging(log_dir: Path):
     """
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "organizer.log"
+
+    # Route warnings.warn() through logging so they reach organizer.log.
+    # Without this they go straight to stderr and never touch a handler, so a
+    # real library scan showed "Truncated File Read" and rawpy's OpenMP warning
+    # on the console while the log file recorded nothing — the log looked clean
+    # precisely where something was wrong. These matter: a truncated TIFF names
+    # a file worth investigating.
+    logging.captureWarnings(True)
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s [%(levelname)s] (pid:%(process)d/%(threadName)s) %(message)s',
@@ -403,7 +492,9 @@ def init_database(db_path: str):
             is_master BOOLEAN DEFAULT 0,
             status TEXT,
             metadata_json TEXT,
-            has_name_collision BOOLEAN DEFAULT 0
+            has_name_collision BOOLEAN DEFAULT 0,
+            file_size INTEGER,
+            file_mtime REAL
         )
     """)
     cursor.execute("""
@@ -484,6 +575,21 @@ def _migrate_schema(conn: sqlite3.Connection):
                 migrated += 1
         if migrated:
             logger.info(f"Schema migration v0->v1: rewrote {migrated} legacy run targeting filter(s).")
+
+    if current < 2:
+        # v1 -> v2: file_size and file_mtime, so a re-index can tell an
+        # unchanged file from a changed one without reading it. Existing rows
+        # get NULL, which reads as "unknown" and forces one full re-index of
+        # that file — correct, and self-correcting after a single pass.
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(photos)")}
+        for column, decl in (("file_size", "INTEGER"), ("file_mtime", "REAL")):
+            if column not in existing:
+                conn.execute(f"ALTER TABLE photos ADD COLUMN {column} {decl}")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_photos_source_stat "
+            "ON photos(source_path, file_size, file_mtime)"
+        )
+        logger.info("Schema migration v1->v2: added change-detection columns to photos.")
 
     conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)};")
     conn.commit()
@@ -628,6 +734,8 @@ def db_writer_worker(db_path: str):
     pending_writes = 0
     last_flush = time.monotonic()
     date_sources = {DATE_SOURCE_EXIF: 0, DATE_SOURCE_MTIME: 0}
+    status_counts = {}
+    phash_failures = 0
 
     def flush():
         """
@@ -704,8 +812,8 @@ def db_writer_worker(db_path: str):
             cursor.execute(
                 """INSERT INTO photos
                    (source_path, dest_path, sha1_hash, phash, collision_group, is_master, status,
-                    metadata_json, has_name_collision)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    metadata_json, has_name_collision, file_size, file_mtime)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(source_path) DO UPDATE SET
                        dest_path = excluded.dest_path,
                        sha1_hash = excluded.sha1_hash,
@@ -714,7 +822,9 @@ def db_writer_worker(db_path: str):
                        is_master = excluded.is_master,
                        status = excluded.status,
                        metadata_json = excluded.metadata_json,
-                       has_name_collision = excluded.has_name_collision
+                       has_name_collision = excluded.has_name_collision,
+                       file_size = excluded.file_size,
+                       file_mtime = excluded.file_mtime
                 """,
                 (
                     result.file_path,
@@ -725,7 +835,9 @@ def db_writer_worker(db_path: str):
                     1 if result.is_master else 0,
                     status,
                     json.dumps(result.metadata),
-                    1 if result.has_name_collision else 0
+                    1 if result.has_name_collision else 0,
+                    result.file_size,
+                    result.file_mtime
                 )
             )
 
@@ -742,6 +854,9 @@ def db_writer_worker(db_path: str):
             source = result.metadata.get("date_source") if result.metadata else None
             if source in date_sources:
                 date_sources[source] += 1
+            status_counts[status] = status_counts.get(status, 0) + 1
+            if result.phash in ("error", "not_supported"):
+                phash_failures += 1
 
             pending_writes += 1
             if pending_writes >= DB_COMMIT_BATCH_SIZE or (
@@ -764,6 +879,27 @@ def db_writer_worker(db_path: str):
     # so a photo modified late in the evening can land in the next day's folder
     # under a different TZ. Surfacing the count makes that visible per run
     # instead of being something you discover in the organized tree later.
+    # One line that answers "what actually happened?" without reading the whole
+    # log. A real run previously ended with only a file count, so a scan where
+    # hundreds of files failed looked identical to a clean one.
+    total = sum(status_counts.values())
+    if total:
+        breakdown = ", ".join(f"{n:,} {st.lower()}" for st, n in sorted(status_counts.items()))
+        logger.info(f"Index summary: {total:,} file(s) recorded — {breakdown}.")
+        failed = status_counts.get("Failed", 0)
+        if failed:
+            logger.warning(
+                f"{failed:,} file(s) failed and were recorded with a reason — query them with: "
+                f"SELECT source_path, error_message FROM operations "
+                f"WHERE status = 'Failed' AND run_id = (SELECT MAX(id) FROM runs);"
+            )
+        if phash_failures:
+            logger.warning(
+                f"{phash_failures:,} file(s) produced no perceptual hash (undecodable or "
+                f"unsupported format). They are indexed and will move/copy normally, but "
+                f"cannot participate in Phase 3 similarity matching."
+            )
+
     from_exif = date_sources[DATE_SOURCE_EXIF]
     from_mtime = date_sources[DATE_SOURCE_MTIME]
     if from_exif or from_mtime:
@@ -902,6 +1038,17 @@ def parse_exif_date(value: str) -> Optional[datetime]:
 # difference that compounds across a large library.
 _worker_exiftool: Optional["pyexiftool.ExifToolHelper"] = None
 
+# Consecutive ExifTool failures in this worker. The self-healing respawn below
+# is worth doing for a one-off bad file, but repeating it forever is not: if
+# ExifTool is broken in this process rather than confused by one image, every
+# subsequent file pays a terminate-and-respawn — silently, since the failure
+# was logged at DEBUG. That cost a real library run 4.75 seconds PER FILE with
+# the CPU almost idle (112% of 2400% available) and not one line in the log to
+# explain it. After this many consecutive failures the worker stops trying and
+# falls through to the PIL path, which is the documented fallback anyway.
+_worker_exiftool_failures = 0
+MAX_CONSECUTIVE_EXIFTOOL_FAILURES = 3
+
 
 def _init_worker_process(exiftool_supported: bool, log_dir: Optional[str] = None):
     """
@@ -975,26 +1122,53 @@ def get_full_exif_via_exiftool(file_path: Path) -> Optional[dict]:
     Uses this worker process's persistent ExifTool instance (see
     _init_worker_process) instead of spawning a subprocess per file.
     """
-    global _worker_exiftool
+    global _worker_exiftool, _worker_exiftool_failures
     if _worker_exiftool is None:
         return None
     try:
         result = _worker_exiftool.get_metadata([str(file_path)])
         if result and isinstance(result, list):
+            _worker_exiftool_failures = 0   # consecutive, not cumulative
             return result[0]
     except Exception as e:
-        logger.debug(f"ExifTool (persistent) extraction failed for {file_path.name}: {e}")
-        # Self-healing: if the persistent subprocess itself died or got into
-        # a bad state (e.g. choked on a malformed file), don't silently lose
-        # ExifTool capability for every remaining file this worker handles —
-        # replace it with a fresh instance and let the NEXT file try again.
+        _worker_exiftool_failures += 1
+
+        # WARNING, not DEBUG. This path costs a process teardown and respawn
+        # per file; a run that silently spends seconds per file on it looks
+        # like a mysteriously slow scan with a clean log, which is exactly how
+        # it presented on a real library.
+        logger.warning(
+            f"ExifTool extraction failed for {file_path.name} "
+            f"(failure {_worker_exiftool_failures} of {MAX_CONSECUTIVE_EXIFTOOL_FAILURES} "
+            f"before this worker gives up on it): {e}"
+        )
+
         try:
-            _worker_exiftool.terminate()
+            # Bounded. PyExifTool's terminate() waits up to 30s by default,
+            # which is indistinguishable from a hang when it happens per file.
+            try:
+                _worker_exiftool.terminate(timeout=5)
+            except TypeError:
+                _worker_exiftool.terminate()
         except Exception:
             pass
+
+        if _worker_exiftool_failures >= MAX_CONSECUTIVE_EXIFTOOL_FAILURES:
+            # Broken in this process, not confused by one file. Stop paying the
+            # respawn on every remaining file and use the PIL fallback.
+            logger.error(
+                f"ExifTool has failed {_worker_exiftool_failures} times consecutively in this "
+                f"worker — disabling it here and falling back to PIL for metadata. Dates and "
+                f"camera details will still be read where PIL can supply them, but the full tag "
+                f"set will be missing and RAW files cannot be read at all."
+            )
+            _worker_exiftool = None
+            return None
+
         try:
             _worker_exiftool = pyexiftool.ExifToolHelper(common_args=[])
-        except Exception:
+        except Exception as spawn_error:
+            logger.error(f"Could not restart ExifTool in this worker: {spawn_error}")
             _worker_exiftool = None
     return None
 
@@ -1100,6 +1274,34 @@ def compute_sha1(file_path: str) -> str:
     return retry_io_operation(f"SHA1 Hash {file_path}", _hash)
 
 
+@contextlib.contextmanager
+def warnings_attributed_to(file_path: str):
+    """
+    Captures library warnings raised while reading one file and re-logs them
+    naming that file.
+
+    Two problems this solves:
+
+    1. The warnings arrive with no indication of WHICH file produced them — on
+       a 29,000-file library that is an alarm with no address.
+
+    2. The wording is actively misleading. PIL's "Truncated File Read" is
+       raised by ImageFile._safe_read as an OSError, then caught and
+       downgraded to a warning by TiffImagePlugin's EXIF IFD parser
+       (ImageFileDirectory_v2.load). It therefore means "the EXIF metadata
+       block is malformed", NOT "the image is truncated" — the parser
+       returns early and the pixel data decodes normally. Files that emit
+       this warning still produce a correct SHA-1 and a correct pHash; the
+       only loss is EXIF tags after the bad one, which can push a photo onto
+       its mtime for dating. Saying "metadata warning" keeps that straight.
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        yield
+    for w in caught:
+        logger.warning(f"{w.category.__name__} metadata warning for {file_path}: {w.message}")
+
+
 def compute_phash(file_path: str) -> str:
     if not IMAGEHASH_SUPPORTED:
         return "not_supported"
@@ -1113,10 +1315,13 @@ def compute_phash(file_path: str) -> str:
         if not (RAWPY_SUPPORTED and PIL_SUPPORTED):
             return "not_supported"
         try:
-            with rawpy.imread(file_path) as raw:
-                rgb = raw.postprocess(use_camera_wb=True, half_size=True, no_auto_bright=True, output_bps=8)
-            img = Image.fromarray(rgb)
-            return str(imagehash.phash(img))
+            with warnings_attributed_to(file_path):
+                with rawpy.imread(file_path) as raw:
+                    rgb = raw.postprocess(
+                        use_camera_wb=True, half_size=True, no_auto_bright=True, output_bps=8
+                    )
+                img = Image.fromarray(rgb)
+                return str(imagehash.phash(img))
         except Exception as e:
             logger.debug(f"rawpy pHash failed for {file_path}: {e}")
             return "error"
@@ -1124,8 +1329,9 @@ def compute_phash(file_path: str) -> str:
     if not PIL_SUPPORTED:
         return "not_supported"
     try:
-        with Image.open(file_path) as img:
-            return str(imagehash.phash(img))
+        with warnings_attributed_to(file_path):
+            with Image.open(file_path) as img:
+                return str(imagehash.phash(img))
     except Exception as e:
         logger.debug(f"PIL pHash failed for {file_path}: {e}")
         return "error"
@@ -1293,6 +1499,52 @@ def copy_verify_delete(source_str: str, dest_str: str, delete_source: bool = Tru
 
 
 # --- Processing Worker ---
+def format_duration(seconds: float) -> str:
+    """Compact human duration: 45s, 12m 30s, 1h 05m."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
+
+
+def log_scan_progress(scanned: int, total: int, started_at: float,
+                      window_files: int, window_bytes: int, window_seconds: float):
+    """
+    Reports progress as RECENT rate plus THROUGHPUT, not a cumulative file count.
+
+    Both distinctions were learned the hard way on a real library. Files differ
+    enormously in cost — RAW was 13% of that library's files but 50% of its
+    bytes, roughly 21 MB against 3 MB — so:
+
+    - A cumulative average decays misleadingly. Indexing RAW first showed
+      "34 files/sec" falling to "7 files/sec" over five minutes while the true
+      rate was flat at 5.05 the entire time. That looks like something
+      degrading. Nothing was.
+    - A file count cannot distinguish "saturated link" from "broken". At 5.05
+      files/sec the engine was moving ~101 MB/s, which is 1GbE at line rate —
+      instantly recognisable as physics rather than a bug, but only if
+      throughput is on screen. Without it an hour went into diagnosing a
+      correctly-working scan.
+
+    The ETA uses the recent rate rather than the average, so it responds when
+    the workload changes character instead of averaging RAW and JPEG together.
+    """
+    elapsed = time.monotonic() - started_at
+    overall_rate = scanned / elapsed if elapsed > 0 else 0
+    recent_rate = (window_files / window_seconds) if window_seconds > 0 else overall_rate
+    recent_mbps = (window_bytes / window_seconds / 1e6) if window_seconds > 0 else 0.0
+    remaining = (total - scanned) / recent_rate if recent_rate > 0 else 0
+    pct = (scanned / total * 100) if total else 100.0
+    logger.info(
+        f"Progress: {scanned:,} of {total:,} files ({pct:.1f}%) — "
+        f"{recent_rate:.1f} files/sec, {recent_mbps:.0f} MB/s — "
+        f"~{format_duration(remaining)} left at this rate "
+        f"(overall avg {overall_rate:.1f} files/sec)."
+    )
+
+
 def _failed_result(file_path_str: str, run_id: int, error_message: str) -> ProcessingResult:
     """Builds the Failed result for a file that could not be scanned at all."""
     return ProcessingResult(
@@ -1325,6 +1577,15 @@ def process_file_task(file_path_str: str, dest_base_path: str, run_id: int) -> P
         )
 
     try:
+        # Cheap next to reading the whole file, and it is what lets progress
+        # report THROUGHPUT rather than only a file count — see
+        # log_scan_progress for why that distinction matters.
+        try:
+            _st = file_path.stat()
+            file_size, file_mtime = _st.st_size, _st.st_mtime
+        except OSError:
+            file_size, file_mtime = 0, 0.0
+
         sha1 = compute_sha1(str(file_path))
         phash = compute_phash(str(file_path))
 
@@ -1356,7 +1617,9 @@ def process_file_task(file_path_str: str, dest_base_path: str, run_id: int) -> P
             status="Pending",
             dest_path=str(target_folder / file_path.name),
             run_id=run_id,
-            has_name_collision=False
+            has_name_collision=False,
+            file_size=file_size,
+            file_mtime=file_mtime
         )
     except Exception as e:
         return _failed_result(file_path_str, run_id, f"{type(e).__name__}: {e}")
@@ -1452,6 +1715,119 @@ def is_hidden_path(path: Path, root: Path) -> bool:
     return any(part.startswith('.') for part in relative.parts)
 
 
+def discover_source_files(root: Path, extensions: set) -> List[str]:
+    """
+    Walks `root` and returns the files worth scanning.
+
+    Uses os.scandir rather than Path.rglob because of what each costs on a
+    NETWORK share. rglob yields bare paths, so the caller must then ask
+    p.is_file() and p.is_symlink() — two stat() calls per entry, and over NFS a
+    stat() is a round trip rather than a page-cache hit. A real library spent
+    28-40 seconds merely enumerating 29,047 files, which is almost exactly
+    29,047 x 2 x ~0.5ms of round trips. os.scandir's DirEntry carries the type
+    from readdir(), so the same walk usually needs no extra syscall at all;
+    measured 8x faster even on a local filesystem, where there is no network
+    latency to hide.
+
+    The extension test is also checked BEFORE the filesystem questions, so a
+    directory full of video or sidecar files costs string comparisons instead
+    of syscalls.
+    """
+    found: List[str] = []
+    stack = [str(root)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    # A leading dot at any level: skip the whole subtree. This
+                    # covers .Trashes/, .Spotlight-V100/ and macOS AppleDouble
+                    # sidecars ("._IMG_0001.jpg") that carry real photo
+                    # extensions and would otherwise index as photographs.
+                    if entry.name.startswith('.'):
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                            continue
+                        if os.path.splitext(entry.name)[1].lower() not in extensions:
+                            continue
+                        if entry.is_file(follow_symlinks=False):
+                            found.append(entry.path)
+                    except OSError as e:
+                        logger.warning(f"Could not inspect {entry.path}: {e}")
+        except OSError as e:
+            # An unreadable directory must not abort the whole scan, for the
+            # same reason an unreadable file does not.
+            logger.warning(f"Could not read directory {current}: {e}")
+    return found
+
+
+def partition_unchanged(db_path: str, candidates: List[str], force: bool = False) -> tuple:
+    """
+    Splits discovered files into (to_scan, unchanged), returning paths whose
+    size and mtime still match what the catalog recorded as `unchanged`.
+
+    Re-indexing previously read EVERY file in full — SHA-1 over the whole file,
+    a complete pixel decode for the perceptual hash, and an ExifTool pass —
+    because nothing consulted the catalog before doing the work, and SHA-1
+    cannot be used to skip: it is the RESULT of reading the file, not something
+    knowable beforehand. Two consecutive indexes of one 29,047-file library
+    took 24m57s and 25m27s; the second gained nothing from the first.
+
+    Comparing size and mtime costs one stat per file instead of reading it —
+    roughly 21 MB of network traffic replaced by a single metadata round trip
+    for a RAW file. A library that has not changed re-indexes in seconds.
+
+    Rows predating this check have NULL size/mtime, which reads as "unknown"
+    and forces one full pass for those files; it is self-correcting after that.
+    A file whose row is not in a settled state is always rescanned, so
+    interrupted or failed work is never skipped on the strength of a stat.
+
+    force=True bypasses the comparison entirely (--force-rehash), for when the
+    concern is content changed without size or mtime moving — which editors do
+    not do in practice, but verification should not require deleting the
+    database.
+    """
+    if force or not candidates:
+        return list(candidates), []
+
+    conn = get_db_connection(db_path)
+    try:
+        known = {
+            row[0]: (row[1], row[2])
+            for row in conn.execute(
+                "SELECT source_path, file_size, file_mtime FROM photos "
+                "WHERE file_size IS NOT NULL AND file_mtime IS NOT NULL "
+                "AND status IN ('Pending', 'Completed', 'Copied', 'Duplicate', 'Removed_Duplicate')"
+            )
+        }
+    finally:
+        conn.close()
+
+    if not known:
+        return list(candidates), []
+
+    to_scan, unchanged = [], []
+    for path in candidates:
+        recorded = known.get(path)
+        if recorded is None:
+            to_scan.append(path)
+            continue
+        try:
+            st = os.stat(path)
+        except OSError:
+            # Cannot stat it, so cannot claim it is unchanged. Let the normal
+            # pipeline record the real failure with its reason.
+            to_scan.append(path)
+            continue
+        if recorded[0] == st.st_size and abs(recorded[1] - st.st_mtime) < 1e-6:
+            unchanged.append(path)
+        else:
+            to_scan.append(path)
+    return to_scan, unchanged
+
+
 def normalize_extensions(raw: str) -> set:
     """
     Parses --exts into the form Path.suffix actually produces.
@@ -1516,6 +1892,13 @@ def main():
         help="Comma-separated list of extensions to scan (e.g. '.jpg,.png'), replacing the built-in default set. "
              "Only affects directory scanning, not --file-ids targeting."
     )
+    parser.add_argument(
+        "--force-rehash", action="store_true",
+        help="Re-read every file even if its size and modification time are unchanged since the "
+             "last Index. Normally unchanged files are skipped without being read at all, which "
+             "is what makes re-indexing fast; use this to verify content that changed without "
+             "size or mtime moving."
+    )
     targeting_group = parser.add_mutually_exclusive_group()
     targeting_group.add_argument(
         "--file-ids", type=parse_file_ids, default=None,
@@ -1545,6 +1928,7 @@ def main():
     )
     args = parser.parse_args()
 
+    start_method = configure_multiprocessing_start_method()
     worker_count = args.workers if args.workers else MAX_WORKER_PROCESSES
     active_extensions = normalize_extensions(args.exts) if args.exts else SUPPORTED_EXTENSIONS
 
@@ -1625,6 +2009,7 @@ def main():
     # conversion happens), but the file-mtime fallback — every file without a
     # usable EXIF date — is interpreted in this zone. A photo taken at 21:00
     # local buckets into the NEXT day under UTC.
+    logger.info(f"Worker start method: {start_method} (avoids unsafe fork with rawpy/OpenMP).")
     _local_now = datetime.now().astimezone()
     logger.info(
         f"Timezone: {_local_now.tzname()} (UTC{_local_now.strftime('%z')}) — "
@@ -1690,16 +2075,22 @@ def main():
             files_to_process = _query_source_subdir(str(db_path), subdir_filter_path)
             logger.info(f"Targeting {len(files_to_process)} already-indexed file(s) under source subdirectory.")
         else:
-            files_to_process = [
-                str(p) for p in source_path.rglob('*')
-                if p.is_file() and not p.is_symlink()
-                and p.suffix.lower() in active_extensions
-                and not is_hidden_path(p, source_path)
-            ]
+            discovered = discover_source_files(source_path, active_extensions)
+            files_to_process, unchanged = partition_unchanged(
+                str(db_path), discovered, force=args.force_rehash
+            )
             logger.info(
-                f"Discovered {len(files_to_process)} supported photo/image files to scan "
+                f"Discovered {len(discovered):,} supported photo/image files "
                 f"(extensions: {', '.join(sorted(active_extensions))})."
             )
+            if unchanged:
+                logger.info(
+                    f"Skipping {len(unchanged):,} unchanged file(s) — size and modification time "
+                    f"still match the catalog, so they are not re-read. "
+                    f"{len(files_to_process):,} file(s) to scan. Pass --force-rehash to re-read everything."
+                )
+            elif args.force_rehash:
+                logger.info("--force-rehash: re-reading every file regardless of the catalog.")
 
         # Submitted in bounded batches rather than all at once. Every
         # completed future holds its ProcessingResult — including the FULL
@@ -1712,6 +2103,11 @@ def main():
         # SIGKILL after ~10s) did nothing at all on a long Index.
         scan_batch_size = max(worker_count * 4, 16)
         scanned = 0
+        scan_started_at = time.monotonic()
+        last_progress_at = scan_started_at
+        last_progress_scanned = 0
+        bytes_done = 0
+        last_progress_bytes = 0
         with ProcessPoolExecutor(
             max_workers=worker_count,
             initializer=_init_worker_process,
@@ -1728,8 +2124,22 @@ def main():
                 batch = files_to_process[batch_start:batch_start + scan_batch_size]
                 futures = [executor.submit(process_file_task, f, str(dest_path), run_id) for f in batch]
                 for future in futures:
-                    put_result(future.result(), db_thread)
+                    result = future.result()
+                    bytes_done += result.file_size
+                    put_result(result, db_thread)
                 scanned += len(batch)
+
+                now = time.monotonic()
+                if now - last_progress_at >= PROGRESS_INTERVAL_SECONDS:
+                    log_scan_progress(
+                        scanned, len(files_to_process), scan_started_at,
+                        window_files=scanned - last_progress_scanned,
+                        window_bytes=bytes_done - last_progress_bytes,
+                        window_seconds=now - last_progress_at,
+                    )
+                    last_progress_at = now
+                    last_progress_scanned = scanned
+                    last_progress_bytes = bytes_done
 
         drain_result_queue(db_thread)
         result_queue.put(None)
@@ -1744,7 +2154,13 @@ def main():
             )
             run_outcome = "Cancelled"
         else:
-            logger.info(f"Scan and indexing completed successfully ({scanned} file(s)). Database updated.")
+            gb = bytes_done / 1e9
+            elapsed = time.monotonic() - scan_started_at
+            logger.info(
+                f"Scan and indexing completed successfully ({scanned:,} file(s), {gb:.1f} GB "
+                f"in {format_duration(elapsed)} — {bytes_done/elapsed/1e6:.0f} MB/s average). "
+                f"Database updated."
+            )
             if args.move or args.copy:
                 run_outcome = _run_move_or_copy(args, db_path, dest_path, run_id)
             else:
