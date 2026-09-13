@@ -1,2 +1,12 @@
 __pycache__/
 *.pyc
+
+# Engine data — these contain real library paths
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+logs/
+volumes/
