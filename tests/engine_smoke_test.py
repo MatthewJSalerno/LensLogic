@@ -58,6 +58,13 @@ def check(condition, message):
         raise Fail(message)
 
 
+def engine_output(proc):
+    """Everything the engine printed. Logging goes to stdout (configure_logging
+    attaches a StreamHandler on sys.stdout), but read both streams so a test
+    asserting on a log line cannot quietly pass or fail on the wrong one."""
+    return (proc.stdout or "") + (proc.stderr or "")
+
+
 def test(fn):
     """Registers a test function. Name doubles as the label."""
     RESULTS.append(fn)
@@ -371,6 +378,37 @@ def source_subdir_with_wildcard_chars_is_literal():
     remaining = sorted(src_files(case))
     check(remaining == ["100XDone/e.jpg", "MyXPhotos/c.jpg"],
           f"'%' was treated as a LIKE wildcard; source still holds {remaining}")
+
+
+@test
+def targeted_runs_skip_unchanged_files():
+    """--source-subdir / --file-ids honour the unchanged-file skip, not just full scans."""
+    case = new_case("targetskip")
+    make_photo(case / "src" / "day1" / "a.jpg", "A")
+    make_photo(case / "src" / "day1" / "b.jpg", "B")
+    make_photo(case / "src" / "day2" / "c.jpg", "C")
+
+    run_engine(case)  # full index; everything now has size+mtime recorded
+
+    # A scoped re-run must not re-read files the catalog already matches.
+    # partition_unchanged() used to be applied only to the full-scan branch,
+    # so targeted runs re-hashed and re-decoded every file — the expensive
+    # path, on exactly the runs the web UI issues.
+    out = engine_output(run_engine(case, "--source-subdir", "day1"))
+    check("Skipping 2 unchanged file(s)" in out,
+          f"scoped re-run did not skip unchanged files; log said:\n{out}")
+
+    # Touching one file must bring exactly that file back into the scan.
+    target = case / "src" / "day1" / "a.jpg"
+    os.utime(target, (time.time() + 10, time.time() + 10))
+    out = engine_output(run_engine(case, "--source-subdir", "day1"))
+    check("Skipping 1 unchanged file(s)" in out,
+          f"a changed file was not re-scanned; log said:\n{out}")
+
+    # --force-rehash still overrides the skip.
+    out = engine_output(run_engine(case, "--source-subdir", "day1", "--force-rehash"))
+    check("Skipping" not in out and "force-rehash" in out,
+          f"--force-rehash did not bypass the skip; log said:\n{out}")
 
 
 @test

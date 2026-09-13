@@ -2192,31 +2192,46 @@ def main():
             # one as Failed with a specific reason. Dropping them here (the
             # previous behavior) made a stale selection silently shrink, with
             # nothing in the audit log explaining where those files went.
-            files_to_process = [r[1] for r in rows if r[2] not in SOURCE_CONSUMED_STATUSES]
-            logger.info(f"Targeting {len(files_to_process)} of {len(args.file_ids)} requested file IDs.")
+            candidates = [r[1] for r in rows if r[2] not in SOURCE_CONSUMED_STATUSES]
+            logger.info(f"Targeting {len(candidates)} of {len(args.file_ids)} requested file IDs.")
         elif subdir_filter_path is not None:
             # Same idea as --file-ids: query already-cataloged rows instead of
             # walking the filesystem. Only rows from a prior Index over this
             # path are visible — a fresh subtree needs a full scan first.
-            files_to_process = _query_source_subdir(str(db_path), subdir_filter_path)
-            logger.info(f"Targeting {len(files_to_process)} already-indexed file(s) under source subdirectory.")
+            candidates = _query_source_subdir(str(db_path), subdir_filter_path)
+            logger.info(f"Targeting {len(candidates)} already-indexed file(s) under source subdirectory.")
         else:
-            discovered = discover_source_files(source_path, active_extensions)
-            files_to_process, unchanged = partition_unchanged(
-                str(db_path), discovered, force=args.force_rehash
-            )
+            candidates = discover_source_files(source_path, active_extensions)
             logger.info(
-                f"Discovered {len(discovered):,} supported photo/image files "
+                f"Discovered {len(candidates):,} supported photo/image files "
                 f"(extensions: {', '.join(sorted(active_extensions))})."
             )
-            if unchanged:
-                logger.info(
-                    f"Skipping {len(unchanged):,} unchanged file(s) — size and modification time "
-                    f"still match the catalog, so they are not re-read. "
-                    f"{len(files_to_process):,} file(s) to scan. Pass --force-rehash to re-read everything."
-                )
-            elif args.force_rehash:
-                logger.info("--force-rehash: re-reading every file regardless of the catalog.")
+
+        # Applies to ALL THREE targeting modes, not just the full scan.
+        #
+        # This used to sit inside the else branch above, so --file-ids and
+        # --source-subdir runs re-read every targeted file in full — SHA-1,
+        # a pixel decode for the perceptual hash, and an ExifTool pass —
+        # even when the catalog already held an identical, current record.
+        # On a real library that meant a scoped --copy of ~9,500 files spent
+        # about seven minutes pulling ~20 GB over the network before the
+        # first byte was copied, recomputing values it already had.
+        #
+        # Those are exactly the runs the web UI issues: the user picks a
+        # folder or a set of files, never "everything". Skipping unchanged
+        # files here is safe because their rows are already Pending with a
+        # resolved dest_path, which is all the Move/Copy phase reads.
+        files_to_process, unchanged = partition_unchanged(
+            str(db_path), candidates, force=args.force_rehash
+        )
+        if unchanged:
+            logger.info(
+                f"Skipping {len(unchanged):,} unchanged file(s) — size and modification time "
+                f"still match the catalog, so they are not re-read. "
+                f"{len(files_to_process):,} file(s) to scan. Pass --force-rehash to re-read everything."
+            )
+        elif args.force_rehash:
+            logger.info("--force-rehash: re-reading every file regardless of the catalog.")
 
         # Submitted in bounded batches rather than all at once. Every
         # completed future holds its ProcessingResult — including the FULL
