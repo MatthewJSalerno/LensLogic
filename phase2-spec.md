@@ -323,6 +323,8 @@ The general principle: the engine guarantees it will never act on something it h
 
 Schema changes are versioned with SQLite's built-in `PRAGMA user_version`, but **there is no in-place upgrade path and none should be added**. The catalog is a derived artifact — every value in it is recomputable from the source files by running an Index — so a catalog recording a different version is refused at startup with instructions to delete and rebuild, rather than migrated. Migration code runs rarely, on real user data, along a path that is almost never exercised; the engine previously carried three migration branches and one had a latent bug that survived until someone read it closely.
 
+**Status values are enforced by the database, not by convention.** Each `status` column carries a `CHECK` constraint listing exactly its vocabulary, generated from the same tuples the engine uses. An API write of `'copied'` or a filter on `'Complete'` fails loudly at write time rather than silently disagreeing with the engine — a mismatch whose only symptom would otherwise be photos that never appear. Treat the constraint as the contract and do not hardcode a parallel list; read it from the engine's constants or from `sqlite_master` if the API needs to enumerate.
+
 **The API layer should not create or alter the schema.** It opens a database the engine owns. It should read `PRAGMA user_version` on startup and refuse to serve if it does not match the version it was built against, surfacing "run a Scan to rebuild the catalog" rather than querying a shape it does not understand. Two writers disagreeing about schema on the same file is exactly what the single-instance lock exists to prevent.
 
 Note the asymmetry this creates for the UI: deleting the catalog is cheap for Index state, but it discards the record of which files a previous Move already migrated. Where the UI offers a rebuild, it should say so.
@@ -346,18 +348,31 @@ CREATE TABLE photos (
                                    -- Duplicate, Removed_Duplicate, Copied
     metadata_json TEXT,           -- full captured EXIF/metadata, not just date
     has_name_collision BOOLEAN DEFAULT 0,
-    thumbnail_path TEXT           -- NEW, not yet implemented — see §4.2.1.
-                                   -- NULL until Phase 2's thumbnail
-                                   -- generation work lands.
+    file_size INTEGER,            -- size/mtime as of the scan that wrote this
+    file_mtime REAL,              -- row; the unchanged-file skip compares
+                                   -- against these instead of re-reading
+    CHECK (status IS NULL OR status IN ('Pending', 'Processing', 'Completed',
+           'Copied', 'Failed', 'Duplicate', 'Removed_Duplicate'))
 );
+-- NOT YET PRESENT: thumbnail_path TEXT. Phase 2 adds it (see §4.2.1); the
+-- block above is the schema as the engine creates it today. Adding it is a
+-- schema change, which means a version bump and a rebuilt catalog, not an
+-- ALTER on a live database.
 
 -- Required, not optional. The engine's per-file duplicate check runs once for
 -- EVERY file scanned; without idx_photos_sha1 it degrades to a full scan of a
 -- table that is itself growing with every file (quadratic over library size).
--- idx_operations_run is what the per-job history view (§5.4) pages over.
+-- idx_operations_run is what the per-job history view (§5.4) pages over, and
+-- idx_operations_photo the per-photo panel — operations is append-only and
+-- grows with files x runs. idx_photos_phash is what Phase 3's match gallery
+-- groups on; idx_photos_source_stat covers the unchanged-file skip.
+-- The engine recreates all six on every startup with IF NOT EXISTS.
 CREATE INDEX idx_photos_sha1 ON photos(sha1_hash);
 CREATE INDEX idx_photos_status ON photos(status);
+CREATE INDEX idx_photos_source_stat ON photos(source_path, file_size, file_mtime);
+CREATE INDEX idx_photos_phash ON photos(phash);
 CREATE INDEX idx_operations_run ON operations(run_id);
+CREATE INDEX idx_operations_photo ON operations(photo_id);
 
 -- runs: one row per engine invocation (Index, Move, or Copy). This is
 -- what "previous run information" (§5.4) is actually built from — no
@@ -376,7 +391,8 @@ CREATE TABLE runs (
                             -- --source-subdir and is kept as-is.
     started_at TEXT NOT NULL,
     ended_at TEXT,
-    status TEXT NOT NULL    -- Running, Completed, Cancelled, Failed, Crashed
+    status TEXT NOT NULL,   -- Running, Completed, Cancelled, Failed, Crashed
+    CHECK (status IN ('Running', 'Completed', 'Cancelled', 'Failed', 'Crashed'))
 );
 
 -- operations: the audit LOG. Append-only — one row per file per run, so
@@ -394,6 +410,10 @@ CREATE TABLE operations (
     error_message TEXT,
     has_name_collision BOOLEAN DEFAULT 0,
     timestamp TEXT NOT NULL,
+    -- Same vocabulary as photos.status, plus Cancelled: work the run reached
+    -- but never started leaves the photo row Pending and records this here.
+    CHECK (status IN ('Pending', 'Processing', 'Completed', 'Copied', 'Failed',
+           'Duplicate', 'Removed_Duplicate', 'Cancelled')),
     FOREIGN KEY(run_id) REFERENCES runs(id),
     FOREIGN KEY(photo_id) REFERENCES photos(id)
 );
