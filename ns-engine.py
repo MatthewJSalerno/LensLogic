@@ -329,6 +329,7 @@ class ProcessingResult:
     collision_group: Optional[int] = None
     is_master: bool = False
     error_message: Optional[str] = None
+    file_size: int = 0
 
 
 # --- Producer-Consumer Queue ---
@@ -1475,15 +1476,39 @@ def format_duration(seconds: float) -> str:
     return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
 
 
-def log_scan_progress(scanned: int, total: int, started_at: float):
-    """Emits one progress line with rate and a remaining-time estimate."""
+def log_scan_progress(scanned: int, total: int, started_at: float,
+                      window_files: int, window_bytes: int, window_seconds: float):
+    """
+    Reports progress as RECENT rate plus THROUGHPUT, not a cumulative file count.
+
+    Both distinctions were learned the hard way on a real library. Files differ
+    enormously in cost — RAW was 13% of that library's files but 50% of its
+    bytes, roughly 21 MB against 3 MB — so:
+
+    - A cumulative average decays misleadingly. Indexing RAW first showed
+      "34 files/sec" falling to "7 files/sec" over five minutes while the true
+      rate was flat at 5.05 the entire time. That looks like something
+      degrading. Nothing was.
+    - A file count cannot distinguish "saturated link" from "broken". At 5.05
+      files/sec the engine was moving ~101 MB/s, which is 1GbE at line rate —
+      instantly recognisable as physics rather than a bug, but only if
+      throughput is on screen. Without it an hour went into diagnosing a
+      correctly-working scan.
+
+    The ETA uses the recent rate rather than the average, so it responds when
+    the workload changes character instead of averaging RAW and JPEG together.
+    """
     elapsed = time.monotonic() - started_at
-    rate = scanned / elapsed if elapsed > 0 else 0
-    remaining = (total - scanned) / rate if rate > 0 else 0
+    overall_rate = scanned / elapsed if elapsed > 0 else 0
+    recent_rate = (window_files / window_seconds) if window_seconds > 0 else overall_rate
+    recent_mbps = (window_bytes / window_seconds / 1e6) if window_seconds > 0 else 0.0
+    remaining = (total - scanned) / recent_rate if recent_rate > 0 else 0
     pct = (scanned / total * 100) if total else 100.0
     logger.info(
         f"Progress: {scanned:,} of {total:,} files ({pct:.1f}%) — "
-        f"{rate:.0f} files/sec, about {format_duration(remaining)} remaining."
+        f"{recent_rate:.1f} files/sec, {recent_mbps:.0f} MB/s — "
+        f"~{format_duration(remaining)} left at this rate "
+        f"(overall avg {overall_rate:.1f} files/sec)."
     )
 
 
@@ -1519,6 +1544,14 @@ def process_file_task(file_path_str: str, dest_base_path: str, run_id: int) -> P
         )
 
     try:
+        # Cheap next to reading the whole file, and it is what lets progress
+        # report THROUGHPUT rather than only a file count — see
+        # log_scan_progress for why that distinction matters.
+        try:
+            file_size = file_path.stat().st_size
+        except OSError:
+            file_size = 0
+
         sha1 = compute_sha1(str(file_path))
         phash = compute_phash(str(file_path))
 
@@ -1550,7 +1583,8 @@ def process_file_task(file_path_str: str, dest_base_path: str, run_id: int) -> P
             status="Pending",
             dest_path=str(target_folder / file_path.name),
             run_id=run_id,
-            has_name_collision=False
+            has_name_collision=False,
+            file_size=file_size
         )
     except Exception as e:
         return _failed_result(file_path_str, run_id, f"{type(e).__name__}: {e}")
@@ -1953,6 +1987,9 @@ def main():
         scanned = 0
         scan_started_at = time.monotonic()
         last_progress_at = scan_started_at
+        last_progress_scanned = 0
+        bytes_done = 0
+        last_progress_bytes = 0
         with ProcessPoolExecutor(
             max_workers=worker_count,
             initializer=_init_worker_process,
@@ -1969,12 +2006,22 @@ def main():
                 batch = files_to_process[batch_start:batch_start + scan_batch_size]
                 futures = [executor.submit(process_file_task, f, str(dest_path), run_id) for f in batch]
                 for future in futures:
-                    put_result(future.result(), db_thread)
+                    result = future.result()
+                    bytes_done += result.file_size
+                    put_result(result, db_thread)
                 scanned += len(batch)
 
-                if time.monotonic() - last_progress_at >= PROGRESS_INTERVAL_SECONDS:
-                    log_scan_progress(scanned, len(files_to_process), scan_started_at)
-                    last_progress_at = time.monotonic()
+                now = time.monotonic()
+                if now - last_progress_at >= PROGRESS_INTERVAL_SECONDS:
+                    log_scan_progress(
+                        scanned, len(files_to_process), scan_started_at,
+                        window_files=scanned - last_progress_scanned,
+                        window_bytes=bytes_done - last_progress_bytes,
+                        window_seconds=now - last_progress_at,
+                    )
+                    last_progress_at = now
+                    last_progress_scanned = scanned
+                    last_progress_bytes = bytes_done
 
         drain_result_queue(db_thread)
         result_queue.put(None)
@@ -1989,7 +2036,13 @@ def main():
             )
             run_outcome = "Cancelled"
         else:
-            logger.info(f"Scan and indexing completed successfully ({scanned} file(s)). Database updated.")
+            gb = bytes_done / 1e9
+            elapsed = time.monotonic() - scan_started_at
+            logger.info(
+                f"Scan and indexing completed successfully ({scanned:,} file(s), {gb:.1f} GB "
+                f"in {format_duration(elapsed)} — {bytes_done/elapsed/1e6:.0f} MB/s average). "
+                f"Database updated."
+            )
             if args.move or args.copy:
                 run_outcome = _run_move_or_copy(args, db_path, dest_path, run_id)
             else:
