@@ -127,6 +127,7 @@ Metadata Extraction:
 """
 
 import argparse
+import errno
 import fcntl
 import hashlib
 import json
@@ -291,6 +292,28 @@ def _handle_cancel_signal(signum, frame):
 
 
 # --- Resilient Network IO Wrapper ---
+# Conditions that are a property of the path or the filesystem, not a hiccup.
+# Retrying these cannot possibly succeed, and sleeping through the backoff
+# first turns a fast, clear failure into a slow one. The case that exposed
+# this: --move against a source mounted :ro raises EROFS on every delete, so
+# each file burned the full 1s + 2s backoff before failing — three seconds per
+# file, guaranteed, which on a 10,000-photo library is over eight hours of
+# sleeping to arrive at "nothing worked". Genuinely transient conditions
+# (below, the reason this wrapper exists at all) still get the full backoff.
+PERMANENT_IO_ERRNOS = frozenset({
+    errno.EROFS,          # read-only filesystem — e.g. a :ro volume mount
+    errno.EACCES,         # permission denied
+    errno.EPERM,
+    errno.ENOENT,         # the file is gone; waiting will not bring it back
+    errno.EISDIR,
+    errno.ENOTDIR,
+    errno.ENOSPC,         # out of space — retrying the same write is futile
+    errno.EXDEV,          # cross-device link
+    errno.ENAMETOOLONG,
+})
+
+
+
 def retry_io_operation(action_description: str, func: Callable[..., Any], *args, **kwargs) -> Any:
     """Executes an IO function with exponential backoff to handle transient network share issues."""
     delay = INITIAL_RETRY_DELAY
@@ -298,6 +321,12 @@ def retry_io_operation(action_description: str, func: Callable[..., Any], *args,
         try:
             return func(*args, **kwargs)
         except (OSError, PermissionError, IOError) as e:
+            if getattr(e, "errno", None) in PERMANENT_IO_ERRNOS:
+                logger.error(
+                    f"IO operation cannot succeed [{action_description}]: {e}. "
+                    f"Not retrying — this is a permanent condition, not a transient one."
+                )
+                raise
             if attempt == MAX_RETRIES:
                 logger.error(f"IO Operation failed after {MAX_RETRIES} attempts [{action_description}]: {e}")
                 raise e
@@ -1688,6 +1717,11 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
             # earlier run. Re-copying would just create IMG_0001_1.jpg beside
             # it, and another one next cycle. For --move the operation is still
             # completed by removing the now-redundant source.
+            #
+            # Logged BEFORE attempting the delete: the delete can fail noisily
+            # (a :ro source, say), and having the explanation arrive after the
+            # errors it explains makes the log read backwards.
+            logger.info(f"Already present at destination, skipping copy: {Path(src).name} -> {resolved_dst}")
             if args.move:
                 try:
                     retry_io_operation(f"Delete already-copied source {Path(src).name}", Path(src).unlink)
@@ -1699,7 +1733,6 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
             else:
                 final_status = "Copied"
                 skip_error = None
-            logger.info(f"Already present at destination, skipping copy: {Path(src).name} -> {resolved_dst}")
             cursor.execute(
                 "UPDATE photos SET status = ?, dest_path = ? WHERE id = ?",
                 (final_status, resolved_dst, record_id)

@@ -59,7 +59,7 @@ docker run --rm \
   negativespace python3 ns-engine.py --copy
 ```
 
-> **Note:** `--move` against a read-only-mounted source will not corrupt anything, but every file will report `status='Failed'` (the copy succeeds; only the source deletion fails) and repeated attempts will accumulate orphaned duplicate copies at the destination. Use `--copy` for read-only sources instead.
+> **Note:** `--move` against a read-only-mounted source will not corrupt anything, but every file will report `status='Failed'` — the copy succeeds and only the source deletion fails, so nothing is ever lost. Re-running is safe and does **not** accumulate duplicate copies: the engine recognizes that an identical copy already exists at the destination and skips rewriting it, failing only on the delete. Use `--copy` for read-only sources instead — it is the same verified copy without the futile delete step.
 
 ---
 
