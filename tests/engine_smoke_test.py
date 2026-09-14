@@ -796,8 +796,10 @@ def status_columns_are_constrained():
     # this column, so the database has to enforce the vocabulary itself.
     conn = db(case)
     try:
-        check(conn.execute("PRAGMA user_version").fetchone()[0] == 3,
+        check(conn.execute("PRAGMA user_version").fetchone()[0] == 4,
               "schema version stamp is wrong")
+        # 'Skipped' is an operation outcome, never a photo state.
+        conn.execute("INSERT INTO operations (run_id, status, timestamp) VALUES (1, 'Skipped', 't')")
 
         for sql, params, label in (
             ("INSERT INTO photos (source_path, status) VALUES ('/typo.jpg', ?)",
@@ -1069,6 +1071,176 @@ def durability_barriers_precede_source_deletion():
     check(data_synced, f"the copy's bytes were not fsynced before the source was deleted: {events}")
     check(("fsync", os.path.realpath(dest.parent)) in before,
           f"the destination directory was not fsynced before the source was deleted: {events}")
+
+
+# ------------------------------------------------------- selection and plan
+#
+# A run must act on exactly what it was asked to act on, and a photo's
+# classification must follow the catalog as it is now, not as it was when a
+# file was last read.
+
+@test
+def source_subdir_is_case_sensitive():
+    """--source-subdir: 'Album' does not also select 'album' on case-sensitive storage."""
+    # SQLite's LIKE ignores ASCII case, so escaping wildcards fixed only half
+    # of the prefix match: Album and album were still treated as one folder.
+    case = new_case("subdircase")
+    make_photo(case / "src" / "Album" / "a.jpg", "A")
+    make_photo(case / "src" / "album" / "b.jpg", "B")
+    run_engine(case)
+    run_engine(case, "--move", "--source-subdir", "Album")
+    check(src_files(case) == ["album/b.jpg"],
+          f"selecting 'Album' also moved files from 'album': source holds {src_files(case)}")
+
+
+@test
+def full_runs_stay_inside_the_source_root():
+    """Without targeting, Move acts only on rows under this run's --source, not the whole catalog."""
+    # One --base can hold rows from several source roots. A full run swept
+    # every Pending row in the catalog, so moving root B also moved root A's
+    # photos — and duplicate cleanup reached into root A too.
+    case = new_case("two_roots")
+    make_photo(case / "src" / "a.jpg", "ROOT-A")
+    make_photo(case / "src" / "a_twin.jpg", "ROOT-A")
+    make_photo(case / "srcB" / "b.jpg", "ROOT-B")
+    run_engine(case)
+    run_engine(case, "--move", "--source", case / "srcB")
+    check(src_files(case) == ["a.jpg", "a_twin.jpg"],
+          f"a move of root B acted on root A: root A now holds {src_files(case)}")
+    check(not (case / "srcB" / "b.jpg").exists(), "root B's own photo was not moved")
+
+
+@test
+def destination_follows_the_current_dest():
+    """A destination given at Move/Copy time wins over the one the file was indexed against."""
+    # The unchanged-file skip reuses a file's catalog row, which carried a
+    # destination computed against the --dest current at Index time. Copying
+    # to a new destination wrote into the OLD one, after checking free space
+    # on the new one.
+    case = new_case("dest_changed")
+    make_photo(case / "src" / "a.jpg", "A")
+    run_engine(case)
+    run_engine(case, "--copy", "--dest", case / "dest2")
+    check(dest_files(case) == [], f"the copy wrote into the Index-time destination: {dest_files(case)}")
+    check((case / "dest2" / "2024" / "02" / "14" / "a.jpg").is_file(),
+          "the copy did not land in the destination given to this run")
+
+
+@test
+def copy_then_move_completes_the_move():
+    """--copy, then --move of the same unchanged file, deletes the source against the existing copy."""
+    # The unchanged-file skip froze the row at Copied, and --move acted only
+    # on Pending rows, so a verified copy could never be followed by a move.
+    case = new_case("copy_then_move")
+    make_photo(case / "src" / "a.jpg", "A")
+    run_engine(case, "--copy")
+    run_engine(case, "--move")
+    check(src_files(case) == [], f"the move left the source behind after a copy: {src_files(case)}")
+    check(status_of(case, "a.jpg") == "Completed",
+          f"expected Completed, got {status_of(case, 'a.jpg')}")
+    check(dest_files(case) == ["2024/02/14/a.jpg"],
+          f"expected the one existing copy, not a second: {dest_files(case)}")
+
+
+@test
+def a_duplicate_selected_alone_gets_an_outcome():
+    """Selecting only a duplicate records why nothing was written, instead of succeeding silently."""
+    # Duplicates are never written — their original carries the content — so a
+    # selection holding only the duplicate did nothing, exited 0 and recorded
+    # no operation at all. Phase 2 would have shown that job as a success.
+    case = new_case("dup_alone")
+    make_photo(case / "src" / "a.jpg", "TWIN")
+    make_photo(case / "src" / "b.jpg", "TWIN")
+    run_engine(case)
+    anchor = rows(case, "SELECT id FROM photos WHERE status = 'Pending'")[0]["id"]
+    dup = rows(case, "SELECT id FROM photos WHERE status = 'Duplicate'")[0]["id"]
+    for mode in ("--copy", "--move"):
+        run_engine(case, mode, "--file-ids", dup)
+        outcome = rows(case, "SELECT status, error_message FROM operations "
+                             "WHERE photo_id = ? AND run_id = (SELECT MAX(id) FROM runs)", (dup,))
+        check([o["status"] for o in outcome] == ["Skipped"],
+              f"{mode}: expected one Skipped outcome for the duplicate, got {outcome}")
+        check(f"#{anchor}" in (outcome[0]["error_message"] or ""),
+              f"{mode}: the outcome did not name the original it duplicates: {outcome}")
+    check(len(src_files(case)) == 2 and dest_files(case) == [],
+          "a duplicate-only selection moved or copied something")
+
+
+@test
+def an_edited_original_frees_its_duplicate():
+    """When a duplicate's original changes content, the duplicate is delivered in its own right."""
+    # The unchanged-file skip left the twin frozen as Duplicate while its
+    # original's content changed underneath it. The twin then had no original
+    # anywhere, so it was never delivered — only warned about.
+    case = new_case("edited_anchor")
+    make_photo(case / "src" / "a.jpg", "TWIN")
+    make_photo(case / "src" / "b.jpg", "TWIN")
+    run_engine(case)
+    anchor = Path(rows(case, "SELECT source_path FROM photos WHERE status = 'Pending'")[0]["source_path"])
+    time.sleep(1.1)  # a visibly different mtime at any filesystem's resolution
+    make_photo(anchor, "EDITED")
+    run_engine(case, "--move")
+    check(src_files(case) == [], f"a photo was left behind in the source: {src_files(case)}")
+    check(len(dest_files(case)) == 2, f"expected both distinct photos delivered, got {dest_files(case)}")
+
+
+@test
+def duplicate_removal_keeps_the_copy_that_verified():
+    """After duplicate cleanup, the row points at the copy that actually matched, not an arbitrary one."""
+    # Cleanup verified the second of two recorded copies and stored it; the
+    # repoint step that followed then overwrote it with the first delivered
+    # row it found — the stale one.
+    case = new_case("repoint_verified")
+    make_photo(case / "src" / "a.jpg", "TWIN")
+    make_photo(case / "src" / "b.jpg", "TWIN")
+    run_engine(case)
+    anchor = rows(case, "SELECT * FROM photos WHERE status = 'Pending'")[0]
+    dup = rows(case, "SELECT * FROM photos WHERE status = 'Duplicate'")[0]
+    run_engine(case, "--move", "--file-ids", anchor["id"])
+    stale = Path(rows(case, "SELECT dest_path FROM photos WHERE id = ?", (anchor["id"],))[0]["dest_path"])
+    good = stale.parent / "second-copy.jpg"
+    shutil.copyfile(dup["source_path"], good)
+    conn = db(case)
+    try:
+        # A second delivered copy of the same content, recorded after the
+        # anchor, so a "first delivered row" lookup lands on the anchor's copy.
+        conn.execute("INSERT INTO photos (source_path, dest_path, sha1_hash, status) "
+                     "VALUES (?, ?, ?, 'Completed')", ("/elsewhere/second.jpg", str(good), dup["sha1_hash"]))
+        conn.commit()
+    finally:
+        conn.close()
+    stale.write_bytes(stale.read_bytes() + b"now stale")
+    run_engine(case, "--move", "--file-ids", dup["id"])
+    check(not Path(dup["source_path"]).exists(), "the duplicate was not removed against the matching copy")
+    final = rows(case, "SELECT status, dest_path FROM photos WHERE id = ?", (dup["id"],))[0]
+    check(final["status"] == "Removed_Duplicate" and final["dest_path"] == str(good),
+          f"the row should name the copy that verified ({good}), got {final}")
+
+
+@test
+def operations_carry_the_content_hash():
+    """Every audit row for a hashed file records that hash, so history can outlive a catalog rebuild."""
+    case = new_case("op_hash")
+    make_photo(case / "src" / "a.jpg", "A")
+    run_engine(case, "--move")
+    photo = rows(case, "SELECT id, sha1_hash FROM photos")[0]
+    ops = rows(case, "SELECT status, sha1_hash FROM operations WHERE photo_id = ?", (photo["id"],))
+    check(len(ops) >= 2, f"expected a scan and a move operation, got {ops}")
+    check(all(o["sha1_hash"] == photo["sha1_hash"] for o in ops),
+          f"operations did not record the file's content hash: {ops}")
+    indexes = {r["name"] for r in rows(case, "SELECT name FROM sqlite_master WHERE type = 'index'")}
+    check("idx_operations_sha1" in indexes, f"content-history lookups are unindexed: {indexes}")
+
+
+@test
+def transfer_lines_name_the_source_path():
+    """Per-file transfer lines identify a file by its path under the source, not only its name."""
+    # One filename can exist in dozens of folders; a bare name does not say
+    # which file was copied.
+    case = new_case("log_relpath")
+    make_photo(case / "src" / "trip" / "IMG_0001.jpg", "A")
+    out = engine_output(run_engine(case, "--copy"))
+    check("trip/IMG_0001.jpg ->" in out, f"the transfer line did not name the path under the source:\n{out}")
 
 
 # ---------------------------------------------------------------------- main
