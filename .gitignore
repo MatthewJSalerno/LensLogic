@@ -10,3 +10,7 @@ __pycache__/
 *.log
 logs/
 volumes/
+
+# AI Conversations
+REVIEW_LOG.md
+ai-reviews/
