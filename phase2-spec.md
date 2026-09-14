@@ -214,6 +214,10 @@ Jobs run asynchronously in FastAPI. If a user closes or refreshes their browser,
 ### 5.3 Error Center
 If operations fail, an Error Banner highlights the failures, sourced directly from the `operations` log's `error_message` column (see §6.1) — the real exception text is persisted, not just a generic "failed" flag.
 
+**Failures belong to attempts, not to a photo's current status.** Query `operations.status = 'Failed'`, joining the photo and run for context; do not filter on `photos.status`. The two deliberately disagree in at least one case: when duplicate cleanup cannot verify that a destination copy still matches the source, it leaves the photo `Duplicate` — correct, since the source is intact and still a duplicate — while recording a `Failed` operation explaining why the deletion did not happen. An Error Center filtering on `photos.status` would show that photo as an ordinary duplicate and never surface the failure, which is the invisibility the recorded operation exists to end.
+
+For that case specifically, the recorded `error_message` reads `Duplicate verification failed: ...`, and the underlying cause is worth distinguishing in the UI: a `ChecksumMismatch` means the two files' contents differ, while an `OSError` means one of them could not be read and the comparison never happened. Neither should be presented as "the destination is a verified backup", and neither should suggest deleting anything by hand.
+
 ```
 +-----------------------------------------------------------------------------------+
 | FAILED OPERATIONS (3 Items)                                                       |
@@ -236,7 +240,7 @@ If operations fail, an Error Banner highlights the failures, sourced directly fr
 
 Users can view exact system error strings (e.g., `PermissionError`, `ChecksumMismatch`, `Source file changed`). The distinct wording on the third case (`project-spec.md` §4.2) is intentional — it should read differently from a permissions/disk failure, since the fix is "run an Index" rather than "check destination permissions."
 
-**No dedicated retry subsystem.** There is no "Retry Item" / "Retry All Failed" backend endpoint and no `retry_count` tracking. A failed file's `photos.status` is reset to `Pending` automatically the next time it's re-indexed (a plain re-scan, full or `--file-ids`-scoped), so retrying is just re-running the same operation — files that already succeeded are gone from `--source` and won't be touched again, so this is fast even for a large batch with only a few failures. The web UI's equivalent of "retry" is simply selecting the failed items (they're still visible with `status = 'Failed'`) and re-issuing the same Move/Copy operation via `POST /api/v1/jobs/start` with their IDs in `file_ids` — no new endpoint required.
+**No dedicated retry subsystem.** There is no "Retry Item" / "Retry All Failed" backend endpoint and no `retry_count` tracking. A failed file's `photos.status` is reset to `Pending` automatically the next time it's re-indexed (a plain re-scan, full or `--file-ids`-scoped), so retrying is just re-running the same operation — files that already succeeded are gone from `--source` and won't be touched again, so this is fast even for a large batch with only a few failures. The web UI's equivalent of "retry" is selecting the photos associated with failed attempts and re-issuing the same Move/Copy operation via `POST /api/v1/jobs/start` with their IDs in `file_ids` — no new endpoint required. Take those IDs from the failed `operations` rows rather than from `photos.status`, deduplicating when several attempts reference one photo, and do not require the photo's current status to be `Failed`: a duplicate-verification failure stays `Duplicate` and is retried by Move's duplicate cleanup on the next run. Retrying does not by itself fix a content mismatch or an unreadable file, so the UI should not promise that it will.
 
 ### 5.4 Operations Audit Log (`/logs`)
 A searchable table logging every operation performed by the engine:
@@ -580,9 +584,11 @@ Returns inspector details for a specific photo.
       ]
     }
 
-GET /api/v1/photos?status=Failed
+GET /api/v1/operations?status=Failed
 
-Fetches failed items for display in the Error Center (§5.3). "Retrying" is just selecting these IDs and calling `POST /api/v1/jobs/start` again with the same mode — no separate retry endpoint, per the design note in §5.3.
+Fetches failed attempts for the Error Center (§5.3), filtering on `operations.status`. Returns the operation ID, photo ID (nullable), run ID, timestamp, source and destination paths, status, error message, and the associated photo's current status as a separate field — the two are not interchangeable, per §5.3. Left-join the photo so a missing row cannot hide a failure. Supports run and date filters with stable ordering for pagination.
+
+`GET /api/v1/photos?status=Failed` remains available for filtering the catalog, but it is not the Error Center's data source: it misses any failure whose photo is not currently `Failed`. "Retrying" is selecting the associated photo IDs and calling `POST /api/v1/jobs/start` again with the same mode — no separate retry endpoint, per the design note in §5.3.
 
 ---
 
