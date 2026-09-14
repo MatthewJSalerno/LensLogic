@@ -4,7 +4,10 @@ End-to-end smoke tests for ns-engine.py.
 
 Run this INSIDE the container (or anywhere ExifTool, Pillow, imagehash and
 rawpy are installed) — it drives the real engine as a subprocess against real
-image files, rather than importing it and stubbing things out.
+image files, rather than importing it and stubbing things out. The exceptions
+are a few content-safety tests that import the engine in-process to inject a
+fault BETWEEN two steps of one function (after verification, before the
+source is deleted) — a window a subprocess offers no way to act inside.
 
     docker build -t negativespace .
     docker run --rm -v "$PWD":/app -w /app negativespace python3 tests/engine_smoke_test.py
@@ -619,7 +622,10 @@ def sigkill_during_move_is_reconciled_and_loses_nothing():
     for r in rows(case, "SELECT source_path, dest_path, status FROM photos"):
         src_there = Path(r["source_path"]).exists()
         dst_there = r["dest_path"] and Path(r["dest_path"]).exists()
-        partial = r["dest_path"] and Path(r["dest_path"] + ".organizing.partial").exists()
+        # Partials carry a unique suffix after ".organizing.partial", so match
+        # by prefix; an exact-name check would silently find nothing.
+        partial = r["dest_path"] and any(
+            Path(r["dest_path"]).parent.glob(Path(r["dest_path"]).name + ".organizing.partial*"))
         if not (src_there or dst_there or partial):
             missing.append(r["source_path"])
     check(not missing, f"photos vanished from both source and destination after SIGKILL: {missing[:5]}")
@@ -630,7 +636,7 @@ def sigkill_during_move_is_reconciled_and_loses_nothing():
     check(stuck == 0, "reconciliation left rows stuck in Processing")
     crashed = rows(case, "SELECT COUNT(*) c FROM runs WHERE status = 'Crashed'")[0]["c"]
     check(crashed >= 1, "the killed run should have been marked Crashed on the next startup")
-    leftover = list((case / "dest").rglob("*.organizing.partial"))
+    leftover = list((case / "dest").rglob("*.organizing.partial*"))
     check(not leftover, f"orphaned partial files were not cleaned up: {leftover}")
 
     # Finish the job; everything must end up at the destination exactly once.
@@ -830,6 +836,239 @@ def batched_scan_records_every_file():
     check(got == count, f"expected {count} rows after a multi-batch scan, got {got}")
     ops = rows(case, "SELECT COUNT(*) c FROM operations")[0]["c"]
     check(ops >= count, f"expected an audit row per file, got {ops}")
+
+
+# ------------------------------------------------------------ content safety
+#
+# Each test below covers a path that could delete the only copy of a photo,
+# or overwrite an unrelated file, while reporting success. The first three
+# drive the engine as a subprocess like the rest of the suite. The last three
+# import it in-process: the windows they cover sit BETWEEN two statements of
+# one function — after verification, before the source is deleted — and a
+# subprocess offers no way to act inside them.
+
+def _load_engine():
+    """Imports ns-engine.py in-process, for the fault-injection tests below."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("ns_engine_under_test", ENGINE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    # With no handler configured, engine warnings reach Python's last-resort
+    # stderr handler and interleave with the test report. These tests assert
+    # on return values and files, never on log text.
+    import logging
+    module.logger.addHandler(logging.NullHandler())
+    module.logger.propagate = False
+    return module
+
+
+def _last_run_failures(case):
+    return rows(case, "SELECT error_message FROM operations "
+                      "WHERE status = 'Failed' AND run_id = (SELECT MAX(id) FROM runs)")
+
+
+@test
+def overlapping_roots_are_refused():
+    """Source and destination that are one folder, nested, or aliased by symlink are refused up front."""
+    # The case that destroys data: a library already in YYYY/MM/DD layout,
+    # moved onto itself. Every file's computed destination IS its own path,
+    # the already-present check hashes the file against itself and matches,
+    # and --move deletes the only copy — with exit 0 and a Completed run.
+    case = new_case("overlap_same")
+    photo = case / "src" / "2024" / "02" / "14" / "IMG_0001.jpg"
+    make_photo(photo, "only-copy")
+    out = engine_output(run_engine(case, "--move", "--dest", case / "src", expect_rc=1))
+    check(photo.exists(),
+          "the only copy of a photo was deleted when source and destination were one folder")
+    check("overlap" in out.lower(), f"the refusal did not say why; log said:\n{out}")
+
+    for label, src, dst in (
+        ("dest_inside_source", "src", "src/organized"),
+        ("source_inside_dest", "dest/inbox", "dest"),
+        ("dest_symlinked_to_source", "src", "link-to-src"),
+    ):
+        case = new_case("overlap_" + label)
+        make_photo(case / src / "IMG_0002.jpg", label)
+        if label == "dest_symlinked_to_source":
+            (case / "link-to-src").symlink_to(case / "src", target_is_directory=True)
+        before = sorted(p.relative_to(case).as_posix() for p in case.rglob("*.jpg"))
+        run_engine(case, "--move", "--source", case / src, "--dest", case / dst, expect_rc=1)
+        after = sorted(p.relative_to(case).as_posix() for p in case.rglob("*.jpg"))
+        check(before == after, f"{label}: files changed despite overlapping roots: {before} -> {after}")
+
+
+@test
+def a_source_is_never_deleted_as_its_own_copy():
+    """If the 'verified copy' is the source file itself, the source is kept and the refusal recorded."""
+    # Startup refusal only sees overlap a path comparison can detect. A second
+    # mount of the same storage is invisible to that, and still produces a
+    # destination "copy" that is really the source. A hard link reproduces
+    # the shape exactly — two names, one file — without bind mounts in CI.
+
+    # 1. The move loop's already-present branch.
+    case = new_case("alias_present")
+    src = case / "src" / "a.jpg"
+    make_photo(src, "alias")
+    run_engine(case)
+    dest = Path(rows(case, "SELECT dest_path FROM photos")[0]["dest_path"])
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    os.link(src, dest)
+    run_engine(case, "--move")
+    check(src.exists(), "the already-present branch deleted a source whose 'copy' was the same file")
+    failures = _last_run_failures(case)
+    check(failures and "same file" in failures[0]["error_message"],
+          f"the refusal was not recorded as a failed operation: {failures}")
+
+    # 2. Duplicate cleanup.
+    case = new_case("alias_duplicate")
+    make_photo(case / "src" / "a.jpg", "twin")
+    make_photo(case / "src" / "b.jpg", "twin")
+    run_engine(case)
+    anchor = rows(case, "SELECT id FROM photos WHERE status = 'Pending'")[0]["id"]
+    duplicate = rows(case, "SELECT id, source_path FROM photos WHERE status = 'Duplicate'")[0]
+    run_engine(case, "--move", "--file-ids", anchor)
+    delivered = Path(rows(case, "SELECT dest_path FROM photos WHERE id = ?", (anchor,))[0]["dest_path"])
+    dup_src = Path(duplicate["source_path"])
+    delivered.unlink()
+    os.link(dup_src, delivered)  # the delivered "copy" is now the duplicate's own file
+    run_engine(case, "--move", "--file-ids", duplicate["id"])
+    check(dup_src.exists(), "duplicate cleanup deleted a source whose 'copy' was the same file")
+    failures = _last_run_failures(case)
+    check(failures and "same file" in failures[0]["error_message"],
+          f"the refusal was not recorded as a failed operation: {failures}")
+
+
+@test
+def a_planted_partial_is_never_followed_or_overwritten():
+    """Staging never writes through a file or symlink already sitting at a predictable partial name."""
+    case = new_case("partial_planted")
+    make_photo(case / "src" / "a.jpg", "payload")
+    run_engine(case)
+    dest = Path(rows(case, "SELECT dest_path FROM photos")[0]["dest_path"])
+    victim = dest.parent / "unrelated.jpg"
+    make_photo(victim, "victim")
+    original = victim.read_bytes()
+    Path(str(dest) + ".organizing.partial").symlink_to(victim)
+    run_engine(case, "--copy")
+    check(victim.read_bytes() == original,
+          "the copy wrote through a planted partial-name symlink into an unrelated file")
+    check(dest.is_file() and not dest.is_symlink()
+          and dest.read_bytes() == (case / "src" / "a.jpg").read_bytes(),
+          "the copy itself did not land intact")
+
+
+@test
+def publish_falls_back_only_when_hardlinks_are_unsupported():
+    """A link failure other than 'not supported' fails the publish instead of falling back to rename()."""
+    import errno
+    engine = _load_engine()
+    case = new_case("publish_fallback")
+    real_link = os.link
+
+    def failing_link(code):
+        def link(*args, **kwargs):
+            raise OSError(code, os.strerror(code))
+        return link
+
+    try:
+        # An I/O error says nothing about hard-link support. Falling back would
+        # trade a no-overwrite primitive for rename(), which replaces silently.
+        partial, dest = case / "eio.partial", case / "eio.jpg"
+        partial.write_bytes(b"staged")
+        os.link = failing_link(errno.EIO)
+        try:
+            engine._finalize_partial(partial, dest)
+            raise Fail("an EIO from os.link was treated as 'hard links unsupported'")
+        except OSError:
+            pass
+        check(not dest.exists(), "the publish fell back to rename() after an unrelated link error")
+
+        # Genuinely unsupported (EPERM, as on FAT/exFAT): the fallback still publishes...
+        partial, dest = case / "eperm.partial", case / "eperm.jpg"
+        partial.write_bytes(b"staged")
+        os.link = failing_link(errno.EPERM)
+        engine._finalize_partial(partial, dest)
+        check(dest.read_bytes() == b"staged", "the no-hard-link fallback no longer publishes")
+
+        # ...and still refuses to replace an existing file.
+        partial, dest = case / "taken.partial", case / "taken.jpg"
+        partial.write_bytes(b"staged")
+        dest.write_bytes(b"already here")
+        try:
+            engine._finalize_partial(partial, dest)
+            raise Fail("the no-hard-link fallback replaced an existing destination file")
+        except engine.DestinationExistsError:
+            pass
+        check(dest.read_bytes() == b"already here", "an existing destination file was overwritten")
+    finally:
+        os.link = real_link
+
+
+@test
+def a_source_edited_after_verification_is_kept():
+    """A source that changes between verification and deletion is kept, and the move reports failure."""
+    engine = _load_engine()
+    case = new_case("edited_mid_move")
+    src = case / "src" / "a.jpg"
+    make_photo(src, "before")
+    dest = case / "dest" / "a.jpg"
+    real_finalize = engine._finalize_partial
+
+    def finalize_then_edit(partial, final):
+        real_finalize(partial, final)
+        with open(src, "ab") as f:
+            f.write(b"edited after verification")
+
+    engine._finalize_partial = finalize_then_edit
+    ok, message = engine.copy_verify_delete(str(src), str(dest), delete_source=True)
+    check(src.exists(), "a source edited after verification was deleted, taking its new content with it")
+    check(src.read_bytes().endswith(b"edited after verification"),
+          "the source's new content was not preserved")
+    check(not ok and message, f"the move reported success although the source changed: {ok!r} {message!r}")
+
+
+@test
+def durability_barriers_precede_source_deletion():
+    """The copy's bytes and its directory entry are fsynced before the source is deleted."""
+    # Verification reads the copy back, but that read can be served entirely
+    # from page cache. On a network source the delete is committed by the
+    # server immediately, so a local power loss before the copy reaches disk
+    # would leave no copy anywhere. Only an fsync ordering closes that.
+    engine = _load_engine()
+    case = new_case("durability")
+    src = case / "src" / "a.jpg"
+    make_photo(src, "durable")
+    dest = case / "dest" / "a.jpg"
+    events = []
+    real_fsync, real_unlink = os.fsync, Path.unlink
+
+    def recording_fsync(fd):
+        events.append(("fsync", os.path.realpath(os.readlink(f"/proc/self/fd/{fd}"))))
+        return real_fsync(fd)
+
+    def recording_unlink(self, *args, **kwargs):
+        events.append(("unlink", os.path.realpath(self)))
+        return real_unlink(self, *args, **kwargs)
+
+    source_real = os.path.realpath(src)
+    os.fsync, Path.unlink = recording_fsync, recording_unlink
+    try:
+        ok, message = engine.copy_verify_delete(str(src), str(dest), delete_source=True)
+    finally:
+        os.fsync, Path.unlink = real_fsync, real_unlink
+    check(ok, f"the move itself failed: {message}")
+
+    deleted_at = next((i for i, e in enumerate(events) if e == ("unlink", source_real)), None)
+    check(deleted_at is not None, f"the source was never deleted: {events}")
+    before = events[:deleted_at]
+    dest_real = os.path.realpath(dest)
+    data_synced = any(
+        kind == "fsync" and (path == dest_real
+                             or os.path.basename(path).startswith(dest.name + ".organizing.partial"))
+        for kind, path in before)
+    check(data_synced, f"the copy's bytes were not fsynced before the source was deleted: {events}")
+    check(("fsync", os.path.realpath(dest.parent)) in before,
+          f"the destination directory was not fsynced before the source was deleted: {events}")
 
 
 # ---------------------------------------------------------------------- main
