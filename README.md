@@ -4,6 +4,8 @@ A backend engine for organizing large photo collections based on EXIF metadata, 
 
 ## Docker Usage
 
+> **Never mount source and destination to the same underlying folder, or place either folder inside the other.** Different container paths (`/data/source` and `/data/dest`) do not make the storage separate. Check the host folders or network-share mappings, including NFS. Overlapping locations can cause unintended processing or deletion of your photos. This configuration is unsupported; the engine does not reliably detect every overlapping mount.
+
 ### Build
 
 ```bash

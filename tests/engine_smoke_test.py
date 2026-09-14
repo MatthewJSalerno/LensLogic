@@ -293,6 +293,44 @@ def exact_duplicate_removed_only_with_verified_copy():
 
 
 @test
+def duplicate_cleanup_rechecks_live_content():
+    """Stale hashes or an unreadable destination must not authorize deletion."""
+    for scenario in ("destination_changed", "source_changed", "destination_unreadable"):
+        case = new_case("dupe_verify_" + scenario)
+        make_photo(case / "src" / "first.jpg", "SAME")
+        make_photo(case / "src" / "second.jpg", "SAME")
+        run_engine(case)
+        anchor = rows(case, "SELECT * FROM photos WHERE status = 'Pending'")[0]
+        duplicate = rows(case, "SELECT * FROM photos WHERE status = 'Duplicate'")[0]
+        run_engine(case, "--move", "--file-ids", anchor["id"])
+        source = Path(duplicate["source_path"])
+        destination = Path(anchor["dest_path"])
+
+        if scenario == "destination_unreadable":
+            destination.unlink()
+            destination.mkdir()  # Exists, but hashing it raises IsADirectoryError.
+        else:
+            changed = source if scenario == "source_changed" else destination
+            before = changed.stat()
+            content = changed.read_bytes()
+            changed.write_bytes(content[:-1] + bytes([content[-1] ^ 1]))
+            # Preserve the stat cache deliberately: deletion must check live
+            # source bytes even when Index regards the file as unchanged.
+            os.utime(changed, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+        expected_source = source.read_bytes()
+        run_engine(case, "--move", "--file-ids", duplicate["id"])
+        check(source.exists(), f"{scenario}: deleted an unverified duplicate")
+        check(source.read_bytes() == expected_source, f"{scenario}: modified the source")
+        check(status_of(case, source.name) == "Duplicate",
+              f"{scenario}: duplicate should remain available for retry")
+        failures = rows(case, "SELECT error_message FROM operations "
+                        "WHERE run_id = (SELECT MAX(id) FROM runs) AND status = 'Failed'")
+        check(len(failures) == 1 and "Duplicate verification failed" in failures[0]["error_message"],
+              f"{scenario}: verification failure missing from audit log: {failures}")
+
+
+@test
 def copy_is_non_destructive_and_idempotent():
     """Copy: sources untouched, and repeated Index+Copy cycles do not multiply files."""
     case = new_case("copy_idem")
