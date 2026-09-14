@@ -73,19 +73,11 @@ scoped to a specific selection via `--file-ids`.
 ### Action Mode Selection
 The UI allows switching between execution modes prior to triggering operations:
 * **Move Mode (`--move`):** Transactional Copy-Verify-Delete. Deletes source files only after SHA-1 checksum verification succeeds at destination.
+
+**No source file is ever deleted on the catalog's word alone.** All three places the engine removes a user file — the verified copy in Move, an already-delivered source it finds at the destination, and a duplicate source during cleanup — hash *both* files live at the moment of the decision. Stored hashes identify a candidate; they never authorize a deletion. A UI must not offer to relax this, and it needs no separate "verify before deleting" option, because there is no path that skips the check.
+
+One consequence for display: after a Move, each `Duplicate` row's `dest_path` is repointed at the location recording its content, and that step reads no files by design. A duplicate's recorded destination therefore means *where its content is recorded*, not *confirmed present and matching*. Do not present it as verified — the guarantee lives at the moment of deletion, not in the column.
 * **Copy Mode (`--copy`):** Non-destructive. Performs verified copy to destination while leaving source files untouched.
-
-### Verify Destination Integrity (optional, user-initiated)
-
-Offer an explicit **Verify destination** action, separate from any Move or Copy. It hashes the destination files the catalog says should exist and reports what is intact, changed, or missing. This answers a question users actually have — *is my organized library still what NegativeSpace put there?* — which nothing else in the product answers.
-
-**It is an integrity report, never a safety toggle.** Duplicate cleanup already hashes both source and destination live immediately before deleting any source file, unconditionally, and that must not become an option the user can switch off: doing so would restore the behavior where an edited destination copy was enough to authorize deleting the last intact original. What this action adds is confidence about the destination as a whole, not permission to skip a check.
-
-The related catalog step it does illuminate is duplicate repointing, which after a Move rewrites each `Duplicate` row's `dest_path` to the location recording its content. That step reads no files by design — it moves a pointer, and every destructive use of that pointer verifies independently. So a duplicate's recorded destination means *where its content should be*, not *confirmed present and matching*. The UI should not imply otherwise unless a verification pass has actually run, and should show when the last one did.
-
-Warn about the cost using the real byte total rather than a generic caution: the work is proportional to the size of the files being checked, which the catalog already knows from `file_size`. On a library of roughly 3,000 duplicates averaging 4 MB this is around 12 GB of reads — a couple of minutes against a local disk, longer across a network mount. Show the estimate before starting, and make it cancellable.
-
-Results are reported, never acted on. Nothing under the destination is deleted or modified by this action, consistent with the engine's invariant (`phase3-spec.md` §3).
 
 ### Selective File Processing
 Users can select individual files or multiple files across grid views to run targeted operations.
