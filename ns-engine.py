@@ -287,12 +287,18 @@ class RunStatus:
 # stopped.
 OPERATION_CANCELLED = "Cancelled"
 
+# 'Skipped' is also an outcome, never a photo state: the run reached a
+# selected photo and deliberately did nothing to it — a duplicate whose
+# original carries its content — and records why, so that every selected
+# photo ends a run with an outcome rather than silence.
+OPERATION_SKIPPED = "Skipped"
+
 PHOTO_STATUSES = (
     PhotoStatus.PENDING, PhotoStatus.PROCESSING, PhotoStatus.COMPLETED,
     PhotoStatus.COPIED, PhotoStatus.FAILED, PhotoStatus.DUPLICATE,
     PhotoStatus.REMOVED_DUPLICATE,
 )
-OPERATION_STATUSES = PHOTO_STATUSES + (OPERATION_CANCELLED,)
+OPERATION_STATUSES = PHOTO_STATUSES + (OPERATION_CANCELLED, OPERATION_SKIPPED)
 RUN_STATUSES = (
     RunStatus.RUNNING, RunStatus.COMPLETED, RunStatus.CANCELLED,
     RunStatus.FAILED, RunStatus.CRASHED,
@@ -300,6 +306,10 @@ RUN_STATUSES = (
 
 # Statuses that mean "already delivered to the destination and verified".
 ANCHOR_DELIVERED_STATUSES = (PhotoStatus.COMPLETED, PhotoStatus.COPIED)
+
+# Statuses in which a row can stand as the original of its duplicate group:
+# its content is delivered, being delivered, or queued to be.
+ANCHOR_STATUSES = (PhotoStatus.PENDING, PhotoStatus.PROCESSING) + ANCHOR_DELIVERED_STATUSES
 
 # Statuses that represent a settled record — the file has been examined and
 # its row is trustworthy. partition_unchanged() will only skip re-reading a
@@ -334,7 +344,7 @@ def sql_values(statuses) -> str:
 # There is no in-place upgrade path: a catalog recording a different version is
 # refused with instructions to delete and re-Index, rather than migrated. See
 # _assert_schema_compatible() for why.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # --- Dependency Check ---
 try:
@@ -626,6 +636,7 @@ def init_database(db_path: str):
             error_message TEXT,
             has_name_collision BOOLEAN DEFAULT 0,
             timestamp TEXT NOT NULL,
+            sha1_hash TEXT,
             CHECK (status IN ({sql_values(OPERATION_STATUSES)})),
             FOREIGN KEY(run_id) REFERENCES runs(id),
             FOREIGN KEY(photo_id) REFERENCES photos(id)
@@ -646,6 +657,9 @@ def init_database(db_path: str):
     # Phase 2's per-photo history panel would scan the whole audit log
     # without this.
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_operations_photo ON operations(photo_id)")
+    # "Everything that ever happened to this content" — across its duplicates
+    # and across catalog rebuilds, where photo_id does not survive.
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_operations_sha1 ON operations(sha1_hash)")
     # Change detection on re-index: partition_unchanged() looks up every
     # candidate by source_path and compares the recorded size/mtime, so the
     # index has to cover all three columns or the lookup pays a row fetch
@@ -760,6 +774,12 @@ def log_operation(conn: sqlite3.Connection, run_id: int, photo_id: Optional[int]
     Appends one row to the operations audit log. Never overwrites — every call
     is new history.
 
+    The row also records the photo's content hash, read from its catalog row
+    in the same statement so no caller has to supply it. photo_id is valid
+    only inside one catalog; the hash names the same content in any catalog,
+    so a photo's history can be matched up again after a rebuild. A file that
+    could not be read has no hash and records NULL.
+
     commit=False leaves the row in the caller's open transaction, for the scan
     phase where many rows are committed together. The Move/Copy loop always
     uses the default: there, each audit row must be durable alongside the file
@@ -768,11 +788,13 @@ def log_operation(conn: sqlite3.Connection, run_id: int, photo_id: Optional[int]
     conn.execute(
         """INSERT INTO operations
            (run_id, photo_id, original_filename, source_path, dest_path, status, error_message,
-            has_name_collision, timestamp)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            has_name_collision, timestamp, sha1_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   (SELECT NULLIF(sha1_hash, '') FROM photos WHERE id = ?))""",
         (
             run_id, photo_id, Path(source_path).name if source_path else None, source_path, dest_path,
-            status, error_message, 1 if has_name_collision else 0, datetime.now().isoformat()
+            status, error_message, 1 if has_name_collision else 0, datetime.now().isoformat(),
+            photo_id
         )
     )
     if commit:
@@ -1513,28 +1535,26 @@ def _sha1_of(path: Path) -> Optional[str]:
         return None
 
 
-def _subdir_prefix_clause(subdir: Path) -> tuple:
+def _path_prefix_clause(root: Path) -> tuple:
     """
-    Builds the (sql_fragment, params) that matches a directory and everything
-    beneath it, with LIKE wildcards in the directory NAME neutralized.
+    Builds the (sql_fragment, params) matching a directory and everything
+    beneath it, compared as literal, case-sensitive text.
 
-    LIKE treats '_' as "any single character" and '%' as "any sequence", and
-    those are ordinary, common characters in folder names. Interpolating a
-    directory straight into a LIKE pattern therefore widens the match: a run
-    scoped to "My_Photos" would build '/data/source/My_Photos/%', which also
-    matches '/data/source/MyXPhotos/...' — a different folder entirely. For
-    --copy that silently copies files the user did not select; for --move it
-    deletes sources outside the selection, which is unrecoverable.
+    A range comparison rather than LIKE. LIKE reads '_' and '%' as wildcards,
+    so "My_Photos" matched "MyXPhotos"; and it ignores ASCII case, so "Album"
+    matched "album" — two different folders on a case-sensitive filesystem.
+    Under --move either one deletes sources outside the selection.
 
-    Escaping the three special characters and declaring ESCAPE makes the
-    prefix literal. Phase 2 lets users pick arbitrary folders in the web UI,
-    so the engine cannot assume well-behaved names.
+    Under TEXT's default BINARY collation, every path beneath `root/` sorts at
+    or after `root/` and strictly before `root0`, because '0' is the character
+    immediately after '/'. The half-open range is therefore exact, needs no
+    escaping, and can use the index on source_path. (Paths are POSIX here: the
+    engine already depends on fcntl.)
     """
-    literal = str(subdir)
-    escaped = literal.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    root_str = str(root)
     return (
-        " AND (source_path = ? OR source_path LIKE ? ESCAPE '\\')",
-        [literal, f"{escaped}{os.sep}%"]
+        " AND (source_path = ? OR (source_path >= ? AND source_path < ?))",
+        [root_str, root_str + "/", root_str + "0"],
     )
 
 
@@ -1542,21 +1562,24 @@ def _targeting_predicate(args) -> tuple:
     """
     Returns (sql_fragment, params) narrowing a `photos` query to whatever this
     run was scoped to — a --file-ids list, a --source-subdir prefix, or the
-    whole library. The fragment is written to be appended after an existing
-    WHERE clause.
+    whole library — and always to this run's own --source root. The fragment
+    is written to be appended after an existing WHERE clause.
 
-    Single source of truth deliberately: the Pending sweep and the duplicate
-    cleanup must agree on what "this run" covers, and previously they did not
-    — cleanup ignored targeting entirely and deleted duplicate source files
-    library-wide even for a two-file selection.
+    Single source of truth deliberately: the Pending sweep, duplicate cleanup
+    and the repoint must agree on what "this run" covers. The root bound
+    matters because one catalog can hold rows from several source roots; an
+    unbounded full run acted on every Pending row in the catalog, so moving
+    one root also moved another's photos.
     """
+    root = Path(args.source).resolve()
+    if args.source_subdir:
+        # Validated in main() to lie under --source, so it is the tighter bound.
+        return _path_prefix_clause((root / args.source_subdir).resolve())
+    clause, params = _path_prefix_clause(root)
     if args.file_ids:
         placeholders = ','.join('?' * len(args.file_ids))
-        return f" AND id IN ({placeholders})", list(args.file_ids)
-    if args.source_subdir:
-        subdir = (Path(args.source).resolve() / args.source_subdir).resolve()
-        return _subdir_prefix_clause(subdir)
-    return "", []
+        return clause + f" AND id IN ({placeholders})", params + list(args.file_ids)
+    return clause, params
 
 
 # --- Copy-Verify-Delete Core Protocol ---
@@ -1726,7 +1749,8 @@ def _finalize_partial(partial_dest: Path, dest: Path):
 
 
 
-def copy_verify_delete(source_str: str, dest_str: str, delete_source: bool = True) -> tuple:
+def copy_verify_delete(source_str: str, dest_str: str, delete_source: bool = True,
+                       label: Optional[str] = None) -> tuple:
     """
     Copies source to dest via a staged, verified, no-overwrite publish.
 
@@ -1774,9 +1798,9 @@ def copy_verify_delete(source_str: str, dest_str: str, delete_source: bool = Tru
                 error_message = f"Copied and verified, but the source was kept: {e}"
                 logger.warning(f"{error_message} ({source_str})")
                 return False, error_message
-            logger.info(f"Successfully migrated: {source.name} -> {dest}")
+            logger.info(f"Successfully migrated: {label or source.name} -> {dest}")
         else:
-            logger.info(f"Successfully copied: {source.name} -> {dest} (source untouched)")
+            logger.info(f"Successfully copied: {label or source.name} -> {dest} (source untouched)")
         return True, None
     except Exception as e:
         error_message = f"{type(e).__name__}: {e}"
@@ -1799,7 +1823,8 @@ def format_duration(seconds: float) -> str:
 
 
 def log_scan_progress(scanned: int, total: int, started_at: float,
-                      window_files: int, window_bytes: int, window_seconds: float):
+                      window_files: int, window_bytes: int, window_seconds: float,
+                      label: str = "Progress"):
     """
     Reports progress as RECENT rate plus THROUGHPUT, not a cumulative file count.
 
@@ -1827,7 +1852,7 @@ def log_scan_progress(scanned: int, total: int, started_at: float,
     remaining = (total - scanned) / recent_rate if recent_rate > 0 else 0
     pct = (scanned / total * 100) if total else 100.0
     logger.info(
-        f"Progress: {scanned:,} of {total:,} files ({pct:.1f}%) — "
+        f"{label}: {scanned:,} of {total:,} files ({pct:.1f}%) — "
         f"{recent_rate:.1f} files/sec, {recent_mbps:.0f} MB/s — "
         f"~{format_duration(remaining)} left at this rate "
         f"(overall avg {overall_rate:.1f} files/sec)."
@@ -2186,7 +2211,7 @@ def _query_source_subdir(db_path: str, subdir_filter_path: Path) -> List[str]:
     # Same escaped prefix the Move/Copy targeting path uses, so an Index-mode
     # rescan and the action that follows it can never disagree about which
     # files "this subdirectory" means.
-    prefix_sql, prefix_params = _subdir_prefix_clause(subdir_filter_path)
+    prefix_sql, prefix_params = _path_prefix_clause(subdir_filter_path)
     rows = conn.execute(
         f"SELECT source_path FROM photos WHERE 1=1{prefix_sql} "
         f"AND status NOT IN ({placeholders})",
@@ -2404,6 +2429,15 @@ def main():
             missing = set(args.file_ids) - found_ids
             if missing:
                 logger.warning(f"file-ids not found in database (never indexed?): {sorted(missing)}")
+            # Bounded by this run's --source like every other targeting mode:
+            # an ID recorded under another source root is not this run's to act on.
+            outside = [r for r in rows if not _is_under(r[1], source_path)]
+            if outside:
+                logger.warning(
+                    f"{len(outside)} requested file ID(s) belong to a different source root than "
+                    f"{source_path} and are left out of this run: {sorted(r[0] for r in outside)}"
+                )
+                rows = [r for r in rows if _is_under(r[1], source_path)]
             already_done = [r for r in rows if r[2] in SOURCE_CONSUMED_STATUSES]
             if already_done:
                 logger.info(
@@ -2555,6 +2589,13 @@ def main():
                 f"in {format_duration(elapsed)} — {bytes_done/elapsed/1e6:.0f} MB/s average). "
                 f"Database updated."
             )
+            promoted, demoted = normalize_duplicate_groups(str(db_path))
+            if promoted or demoted:
+                logger.info(
+                    f"Reclassified duplicates against the current catalog: {promoted} promoted to "
+                    f"Pending (their original changed, failed or disappeared), {demoted} marked "
+                    f"Duplicate (their content is already delivered or queued)."
+                )
             if args.move or args.copy:
                 run_outcome = _run_move_or_copy(args, db_path, dest_path, run_id)
             else:
@@ -2575,6 +2616,127 @@ def main():
         release_single_instance_lock(lock_fd)
 
 
+def _is_under(path: str, root: Path) -> bool:
+    """Literal, case-sensitive containment — the same rule _path_prefix_clause applies in SQL."""
+    root_str = str(root)
+    return path == root_str or path.startswith(root_str + "/")
+
+
+def _display_path(path: str, root: Path) -> str:
+    """A source path as shown in per-file log lines: relative to the run's --source root."""
+    try:
+        return Path(path).relative_to(root).as_posix()
+    except ValueError:
+        return Path(path).name
+
+
+def _destination_for(dest_root: Path, source_path: str, metadata_json: Optional[str],
+                     fallback: str) -> str:
+    """
+    The file's projected destination under THIS run's --dest, computed now.
+
+    The catalog's dest_path was computed against whatever --dest was current
+    when the file was last read, and the unchanged-file skip means that can be
+    long ago: copying to a new destination used to write into the old one,
+    after checking free space on the new one. The date that picks the folder
+    is stored separately, so recomputing costs nothing. The stored path is
+    only a fallback for a row with no recorded date.
+    """
+    try:
+        taken = datetime.fromisoformat(json.loads(metadata_json or "{}").get("date_taken"))
+    except (TypeError, ValueError, AttributeError):
+        return fallback
+    return str(Path(dest_root) / taken.strftime("%Y") / taken.strftime("%m") / taken.strftime("%d")
+               / Path(source_path).name)
+
+
+def _duplicate_skip_reason(cursor, sha1_hash: str, copying: bool) -> tuple:
+    """
+    (reason, pointer) for a duplicate this run deliberately leaves alone. The
+    reason names the original that carries its content; the pointer is where
+    that content already sits, when it has been delivered.
+    """
+    cursor.execute(
+        f"SELECT id, source_path, dest_path, status FROM photos WHERE sha1_hash = ? "
+        f"AND status IN ({sql_values(ANCHOR_STATUSES + (PhotoStatus.FAILED,))}) "
+        f"ORDER BY CASE WHEN status IN ({sql_values(ANCHOR_DELIVERED_STATUSES)}) THEN 0 ELSE 1 END, id "
+        f"LIMIT 1",
+        (sha1_hash,)
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return ("Duplicate with no original left in the catalog; run an Index so it can be "
+                "reclassified.", None)
+    anchor_id, anchor_src, anchor_dest, anchor_status = row
+    name = Path(anchor_src).name
+    if anchor_status in ANCHOR_DELIVERED_STATUSES:
+        if copying:
+            return (f"Duplicate of photo #{anchor_id} ({name}); its content is already at "
+                    f"{anchor_dest}, so there is nothing to copy.", anchor_dest)
+        return (f"Duplicate of photo #{anchor_id} ({name}), whose content was copied but not "
+                f"moved; this source is removed once that photo is moved.", anchor_dest)
+    if anchor_status == PhotoStatus.FAILED:
+        return (f"Duplicate of photo #{anchor_id} ({name}), whose own transfer failed; its "
+                f"content is delivered once that photo succeeds.", None)
+    return (f"Duplicate of photo #{anchor_id} ({name}), which was not part of this selection; "
+            f"its content is delivered when that photo is copied or moved.", None)
+
+
+def normalize_duplicate_groups(db_path: str) -> tuple:
+    """
+    Re-derives Pending versus Duplicate for every content group from the
+    catalog as it is NOW. Returns (promoted, demoted).
+
+    Duplicate is not a property of a file; it is a relation to OTHER rows. The
+    unchanged-file skip means a file's own row is not re-examined when a
+    different row changes, so a duplicate whose original was edited (new
+    hash), failed, or vanished stayed Duplicate with nothing left to deliver
+    its content, and was never organized. Reading hashes is the expensive part
+    and is not repeated here; this reclassifies from stored values only.
+
+    Per content hash: if any row is Completed, Copied or Processing, the
+    content is delivered or in flight, and every Pending or Duplicate row in
+    the group is a Duplicate. Otherwise exactly one row — the oldest Pending,
+    else the oldest Duplicate — is Pending and the rest are Duplicates. Failed
+    rows and removed duplicates take no part. On a catalog built by ordinary
+    Index runs this changes nothing; it only repairs groups that drifted.
+    """
+    delivered_or_in_flight = ANCHOR_DELIVERED_STATUSES + (PhotoStatus.PROCESSING,)
+    open_statuses = (PhotoStatus.PENDING, PhotoStatus.DUPLICATE)
+    conn = get_db_connection(db_path)
+    try:
+        groups = {}
+        for row_id, sha1, status in conn.execute(
+            f"SELECT id, sha1_hash, status FROM photos "
+            f"WHERE sha1_hash IS NOT NULL AND sha1_hash != '' "
+            f"AND status IN ({sql_values(open_statuses + delivered_or_in_flight)}) ORDER BY id"
+        ):
+            groups.setdefault(sha1, []).append((row_id, status))
+
+        promote, demote = [], []
+        for members in groups.values():
+            open_rows = [(i, s) for i, s in members if s in open_statuses]
+            if not open_rows:
+                continue
+            if any(s in delivered_or_in_flight for _, s in members):
+                keep = None
+            else:
+                pending = [i for i, s in open_rows if s == PhotoStatus.PENDING]
+                keep = pending[0] if pending else open_rows[0][0]
+            for i, s in open_rows:
+                wanted = PhotoStatus.PENDING if i == keep else PhotoStatus.DUPLICATE
+                if wanted != s:
+                    (promote if wanted == PhotoStatus.PENDING else demote).append(i)
+
+        conn.executemany("UPDATE photos SET status = ? WHERE id = ?",
+                         [(PhotoStatus.PENDING, i) for i in promote]
+                         + [(PhotoStatus.DUPLICATE, i) for i in demote])
+        conn.commit()
+    finally:
+        conn.close()
+    return len(promote), len(demote)
+
+
 def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
     """
     Runs the Pre-flight space check, then the Move/Copy loop, then (Move
@@ -2588,9 +2750,14 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
     cursor = conn.cursor()
 
     predicate, predicate_params = _targeting_predicate(args)
+    # --move also takes Copied rows. A verified copy already exists, so the
+    # move completes by deleting the source against it — the already-present
+    # branch below re-verifies both sides live first. Without this, --copy
+    # followed by --move of an unchanged file could never finish the move.
+    eligible = (PhotoStatus.PENDING, PhotoStatus.COPIED) if args.move else (PhotoStatus.PENDING,)
     cursor.execute(
-        f"SELECT id, source_path, dest_path FROM photos WHERE status = '{PhotoStatus.PENDING}'"
-        + predicate,
+        f"SELECT id, source_path, dest_path, metadata_json FROM photos "
+        f"WHERE status IN ({sql_values(eligible)})" + predicate,
         predicate_params
     )
     pending_records = cursor.fetchall()
@@ -2601,9 +2768,11 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
     # answers both questions, and its failure IS the "missing" case.
     total_bytes_needed = 0
     missing = 0
-    for _, candidate_src, _ in pending_records:
+    sizes = {}
+    for candidate_id, candidate_src, _, _ in pending_records:
         try:
-            total_bytes_needed += os.stat(candidate_src).st_size
+            sizes[candidate_id] = os.stat(candidate_src).st_size
+            total_bytes_needed += sizes[candidate_id]
         except OSError:
             missing += 1
     if missing:
@@ -2623,16 +2792,38 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
         f"({total_bytes_needed / (1024 ** 2):.2f} MB)..."
     )
 
+    source_root = Path(args.source).resolve()
+    transfer_started = time.monotonic()
+    last_progress_at, last_progress_done, last_progress_bytes = transfer_started, 0, 0
+    bytes_done = 0
     was_cancelled = False
-    for index, (record_id, src, dst) in enumerate(pending_records):
+    for index, (record_id, src, stored_dst, metadata_json) in enumerate(pending_records):
         if cancel_requested.is_set():
             was_cancelled = True
             remaining = pending_records[index:]
             logger.warning(f"Cancellation requested — logging {len(remaining)} remaining item(s) as Cancelled.")
-            for cancelled_id, cancelled_src, cancelled_dst in remaining:
+            for cancelled_id, cancelled_src, cancelled_dst, _ in remaining:
                 log_operation(conn, run_id, cancelled_id, cancelled_src, cancelled_dst,
                               OPERATION_CANCELLED)
             break
+
+        # The same recent-rate progress the scan reports. Between its first and
+        # last lines this phase used to say nothing at all, which on a long run
+        # left no way to see its throughput.
+        now = time.monotonic()
+        if now - last_progress_at >= PROGRESS_INTERVAL_SECONDS:
+            log_scan_progress(
+                index, len(pending_records), transfer_started,
+                window_files=index - last_progress_done,
+                window_bytes=bytes_done - last_progress_bytes,
+                window_seconds=now - last_progress_at,
+                label=f"{action_verb} progress",
+            )
+            last_progress_at, last_progress_done, last_progress_bytes = now, index, bytes_done
+        bytes_done += sizes.get(record_id, 0)
+
+        label = _display_path(src, source_root)
+        dst = _destination_for(dest_path, src, metadata_json, stored_dst)
 
         # Resolve the final filename HERE, immediately before the file is
         # written — not back at Index time. project-spec.md §4.3 requires the
@@ -2668,7 +2859,7 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
             # Logged BEFORE attempting the delete: the delete can fail noisily
             # (a :ro source, say), and having the explanation arrive after the
             # errors it explains makes the log read backwards.
-            logger.info(f"Already present at destination, skipping copy: {Path(src).name} -> {resolved_dst}")
+            logger.info(f"Already present at destination, skipping copy: {label} -> {resolved_dst}")
             if args.move:
                 try:
                     if source_identity is None:
@@ -2723,13 +2914,18 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
         # The fsync cost this would otherwise pay is addressed instead by
         # synchronous=NORMAL (see get_db_connection), which keeps the ordering
         # guarantees intact against process death.
-        cursor.execute("UPDATE photos SET status = ? WHERE id = ?",
-                       (PhotoStatus.PROCESSING, record_id))
+        #
+        # dest_path is written WITH the marker: reconciliation reads it to find
+        # the partial and decide what happened, so it must name where this
+        # file is actually being written, not where the catalog last put it.
+        cursor.execute("UPDATE photos SET status = ?, dest_path = ? WHERE id = ?",
+                       (PhotoStatus.PROCESSING, resolved_dst, record_id))
         conn.commit()
 
         # --move deletes the verified source (delete_source=True, the
         # default); --copy leaves it untouched (delete_source=False).
-        success, error_message = copy_verify_delete(src, resolved_dst, delete_source=args.move)
+        success, error_message = copy_verify_delete(src, resolved_dst, delete_source=args.move,
+                                                    label=label)
 
         if args.move:
             final_status = PhotoStatus.COMPLETED if success else PhotoStatus.FAILED
@@ -2777,10 +2973,12 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
             )
             candidates = [row[0] for row in cursor.fetchall()]
             if not candidates:
-                logger.warning(
-                    f"No verified copy found on disk for duplicate {dup_src} — "
-                    f"leaving source file in place for safety."
-                )
+                # Nothing delivered to verify against, so the source stays.
+                # Recorded as an outcome, not only logged: a duplicate selected
+                # without its original otherwise ended the run with no trace.
+                reason, pointer = _duplicate_skip_reason(cursor, sha1_hash, copying=False)
+                logger.info(f"Kept duplicate source {_display_path(dup_src_str, source_root)}: {reason}")
+                log_operation(conn, run_id, record_id, dup_src_str, pointer, OPERATION_SKIPPED, reason)
                 continue
 
             # Verify LIVE BYTES on both sides before deleting anything.
@@ -2852,6 +3050,22 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
         if duplicate_records:
             logger.info(f"Duplicate cleanup: removed {removed_count} of {len(duplicate_records)} flagged duplicates.")
 
+    if args.copy and not was_cancelled:
+        # --copy never writes a duplicate: its original carries the content.
+        # Record that for each duplicate in scope, so every selected photo has
+        # an outcome. A selection holding only duplicates otherwise did
+        # nothing, exited 0 and recorded nothing — which a UI shows as success.
+        cursor.execute(
+            f"SELECT id, source_path, sha1_hash FROM photos WHERE status = '{PhotoStatus.DUPLICATE}'"
+            + predicate,
+            predicate_params
+        )
+        for record_id, dup_src_str, sha1_hash in cursor.fetchall():
+            reason, pointer = _duplicate_skip_reason(cursor, sha1_hash, copying=True)
+            log_operation(conn, run_id, record_id, dup_src_str, pointer, OPERATION_SKIPPED, reason,
+                          commit=False)
+        conn.commit()
+
     # Point every duplicate at the copy that actually exists.
     #
     # A Duplicate row keeps the dest_path projected for it at Index time — a
@@ -2872,7 +3086,10 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
             "     WHERE anchor.sha1_hash = photos.sha1_hash"
             f"       AND anchor.status IN ({sql_values(ANCHOR_DELIVERED_STATUSES)})"
             "     LIMIT 1)"
-            f" WHERE status IN ({sql_values((PhotoStatus.DUPLICATE, PhotoStatus.REMOVED_DUPLICATE))})"
+            # Duplicate only. A Removed_Duplicate row already names the copy
+            # its deletion was verified against; overwriting it with the first
+            # delivered row found could point it at a different, stale copy.
+            f" WHERE status = '{PhotoStatus.DUPLICATE}'"
             "   AND EXISTS ("
             "    SELECT 1 FROM photos AS anchor"
             "     WHERE anchor.sha1_hash = photos.sha1_hash"

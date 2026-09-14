@@ -220,6 +220,8 @@ If operations fail, an Error Banner highlights the failures, sourced directly fr
 
 **Failures belong to attempts, not to a photo's current status.** Query `operations.status = 'Failed'`, joining the photo and run for context; do not filter on `photos.status`. The two deliberately disagree in at least one case: when duplicate cleanup cannot verify that a destination copy still matches the source, it leaves the photo `Duplicate` — correct, since the source is intact and still a duplicate — while recording a `Failed` operation explaining why the deletion did not happen. An Error Center filtering on `photos.status` would show that photo as an ordinary duplicate and never surface the failure, which is the invisibility the recorded operation exists to end.
 
+**`Skipped` is an outcome, not a failure.** A run records `Skipped` for a selected photo it deliberately left alone — today, a duplicate whose original carries its content — with a reason naming that original (`Duplicate of photo #N ...`). Show these as informational, grouped apart from failures, and link the named original: a user who selected only the duplicate needs to know which photo to select instead. They exist so that every photo in a selection ends the job with a recorded outcome; a job whose selection held only duplicates used to finish green with nothing recorded at all.
+
 For that case specifically, the recorded `error_message` reads `Duplicate verification failed: ...`, and the underlying cause is worth distinguishing in the UI: a `ChecksumMismatch` means the two files' contents differ, while an `OSError` means one of them could not be read and the comparison never happened. Neither should be presented as "the destination is a verified backup", and neither should suggest deleting anything by hand.
 
 ```
@@ -378,13 +380,16 @@ CREATE TABLE photos (
 -- idx_operations_photo the per-photo panel — operations is append-only and
 -- grows with files x runs. idx_photos_phash is what Phase 3's match gallery
 -- groups on; idx_photos_source_stat covers the unchanged-file skip.
--- The engine recreates all six on every startup with IF NOT EXISTS.
+-- idx_operations_sha1 answers "everything that happened to this content",
+-- across duplicates and catalog rebuilds.
+-- The engine recreates all seven on every startup with IF NOT EXISTS.
 CREATE INDEX idx_photos_sha1 ON photos(sha1_hash);
 CREATE INDEX idx_photos_status ON photos(status);
 CREATE INDEX idx_photos_source_stat ON photos(source_path, file_size, file_mtime);
 CREATE INDEX idx_photos_phash ON photos(phash);
 CREATE INDEX idx_operations_run ON operations(run_id);
 CREATE INDEX idx_operations_photo ON operations(photo_id);
+CREATE INDEX idx_operations_sha1 ON operations(sha1_hash);
 
 -- runs: one row per engine invocation (Index, Move, or Copy). This is
 -- what "previous run information" (§5.4) is actually built from — no
@@ -422,10 +427,16 @@ CREATE TABLE operations (
     error_message TEXT,
     has_name_collision BOOLEAN DEFAULT 0,
     timestamp TEXT NOT NULL,
-    -- Same vocabulary as photos.status, plus Cancelled: work the run reached
-    -- but never started leaves the photo row Pending and records this here.
+    sha1_hash TEXT,         -- the photo's content hash, read when the row is
+                            -- written; NULL if the file could not be read.
+                            -- photo_id is valid in one catalog only; this
+                            -- links the same content across rebuilds.
+    -- Same vocabulary as photos.status, plus Cancelled (reached but never
+    -- started; the photo stays Pending) and Skipped (reached and deliberately
+    -- left alone — a duplicate whose original carries its content — with the
+    -- reason, naming that original, in error_message).
     CHECK (status IN ('Pending', 'Processing', 'Completed', 'Copied', 'Failed',
-           'Duplicate', 'Removed_Duplicate', 'Cancelled')),
+           'Duplicate', 'Removed_Duplicate', 'Cancelled', 'Skipped')),
     FOREIGN KEY(run_id) REFERENCES runs(id),
     FOREIGN KEY(photo_id) REFERENCES photos(id)
 );
