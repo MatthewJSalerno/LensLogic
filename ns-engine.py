@@ -145,6 +145,7 @@ import shutil
 import signal
 import sqlite3
 import sys
+import tempfile
 import threading
 import queue
 import time
@@ -224,6 +225,16 @@ SUPPORTED_EXTENSIONS = RASTER_EXTENSIONS | RAW_EXTENSIONS
 DB_FILENAME = "ns_sqlite.db"
 
 PARTIAL_SUFFIX = ".organizing.partial"
+
+# os.link() failures that mean "this filesystem cannot hard-link at all"
+# (FAT/exFAT, some network shares). Only these may fall back to rename(), which
+# replaces an existing file silently; any other link failure fails the publish.
+_NO_HARDLINK_ERRNOS = frozenset({errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP})
+
+# fsync() on a directory is not implemented by every filesystem. These errnos
+# report the operation as absent, not as a failure to persist, so they are
+# tolerated; anything else propagates.
+_DIR_FSYNC_UNSUPPORTED_ERRNOS = frozenset({errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP})
 LOCK_FILENAME = "engine.lock"
 
 # Recorded in each photo's metadata_json as "date_source", so it is always
@@ -539,11 +550,13 @@ def get_db_connection(db_path: str) -> sqlite3.Connection:
     recently committed transactions, and process death is by far the likelier
     failure here.
 
-    Even in that worst case the invariant that matters holds: no source file
-    is ever deleted before a byte-for-byte verified copy exists at the
-    destination. Losing the tail of the WAL can leave a file present at both
-    ends with a stale row describing it — recoverable by re-indexing — never
-    a deleted original with no copy.
+    That bound covers the CATALOG only; it does nothing for the photo files,
+    which is why the file protocol carries its own ordering. A source is
+    deleted only after its verified copy and the copy's directory entry have
+    been fsynced (see _remove_verified_source). With both in place, a power
+    loss can leave a stale row, or a photo present at both ends — recoverable
+    by re-indexing — but not a deleted original without a copy on storage
+    that honours fsync.
     """
     conn = sqlite3.connect(db_path, timeout=10.0)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -1041,11 +1054,21 @@ def reconcile_interrupted_state(db_path: Path):
         for record_id, src_str, dst_str in stuck_records:
             src = Path(src_str)
             dst = Path(dst_str)
-            partial = Path(dst_str + PARTIAL_SUFFIX)
 
-            if partial.exists():
-                logger.warning(f"Found orphaned partial file: {partial.name}. Removing.")
-                partial.unlink()
+            # Partials carry a random suffix (see _stage_copy), so they are
+            # found by prefix rather than one fixed name. Only regular files
+            # are removed: a symlink at a partial-looking name was not created
+            # by this engine, and removing it is not ours to decide.
+            prefix = dst.name + PARTIAL_SUFFIX + "."
+            try:
+                with os.scandir(dst.parent) as entries:
+                    orphans = [e.path for e in entries
+                               if e.name.startswith(prefix) and e.is_file(follow_symlinks=False)]
+            except FileNotFoundError:
+                orphans = []
+            for orphan in orphans:
+                logger.warning(f"Found orphaned partial file: {Path(orphan).name}. Removing.")
+                os.unlink(orphan)
 
             if dst.exists() and not src.exists():
                 logger.info(f"Reconciled completed move for record {record_id}: {dst.name}")
@@ -1537,6 +1560,124 @@ def _targeting_predicate(args) -> tuple:
 
 
 # --- Copy-Verify-Delete Core Protocol ---
+class SourceRemovalRefused(Exception):
+    """
+    Raised when a source file must NOT be deleted even though its content
+    matched. Deliberately not an OSError, so retry_io_operation() never
+    retries it: "this is the same file" and "this changed" are not transient.
+    """
+
+
+def _file_identity(path) -> tuple:
+    """(device, inode, size, mtime_ns) — enough to notice a file was replaced or edited."""
+    st = os.stat(path)
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _fsync_file(path):
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_directory(directory):
+    """Makes a directory's entries durable, tolerating filesystems without directory fsync."""
+    fd = os.open(str(directory), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    except OSError as e:
+        if e.errno not in _DIR_FSYNC_UNSUPPORTED_ERRNOS:
+            raise
+    finally:
+        os.close(fd)
+
+
+def _remove_verified_source(source: Path, verified_copy: Path, source_identity: tuple,
+                            description: str):
+    """
+    The ONLY place a user's source file is deleted.
+
+    Every caller has already compared live hashes of the source and the copy.
+    That is necessary and not sufficient, so this refuses the deletion unless
+    three more things hold, and fails closed on any doubt:
+
+    1. The copy is a DIFFERENT file. Two paths can name one file — one folder
+       mounted at both source and destination, a bind mount, a hard link — and
+       then the hash comparison compared the file with itself; deleting the
+       "source" deletes the only copy. samefile() compares device and inode.
+       It cannot see two separate network mounts of one export, which is why
+       overlapping storage remains documented as unsupported, but it catches
+       every alias the kernel can identify.
+    2. The copy is DURABLE. Verification may have read it back from page
+       cache. On a network source the server commits the delete as soon as
+       the call returns, so a local power loss before the copy reached disk
+       would leave no copy anywhere. The copy and its directory entry are
+       fsynced first.
+    3. The source is still the file that was verified. An edit or replacement
+       after its hash was taken means the copy holds OLD content, and
+       deleting the source would destroy the new content.
+    """
+    try:
+        same = os.path.samefile(source, verified_copy)
+    except OSError as e:
+        raise SourceRemovalRefused(
+            f"could not confirm the copy is a separate file ({type(e).__name__}: {e})")
+    if same:
+        raise SourceRemovalRefused(
+            f"it is the same file as the destination copy ({verified_copy}) — "
+            f"source and destination storage overlap")
+    try:
+        _fsync_file(verified_copy)
+        _fsync_directory(Path(verified_copy).parent)
+    except OSError as e:
+        raise SourceRemovalRefused(
+            f"the destination copy could not be made durable ({type(e).__name__}: {e})")
+    try:
+        unchanged = _file_identity(source) == source_identity
+    except OSError as e:
+        raise SourceRemovalRefused(
+            f"could not re-check the source before deleting it ({type(e).__name__}: {e})")
+    if not unchanged:
+        raise SourceRemovalRefused(
+            "the source changed after it was verified, so its current content has no copy")
+    retry_io_operation(description, source.unlink)
+
+
+def _stage_copy(source: Path, dest: Path) -> Path:
+    """
+    Copies `source` into a NEW, uniquely named partial file beside `dest`,
+    makes it durable, and returns its path.
+
+    The name is created exclusively (O_EXCL) with a random suffix, and every
+    write reopens it with O_NOFOLLOW, so staging never writes through a file
+    or symlink already holding a predictable name. That matters because the
+    engine's no-overwrite check — the publish in _finalize_partial — only
+    runs AFTER staging.
+
+    Mode and timestamps are copied as copy2 does, so the delivered file keeps
+    the source's mtime; the fsync comes after, so data and metadata land
+    together.
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(dest.parent), prefix=f"{dest.name}{PARTIAL_SUFFIX}.")
+    os.close(fd)
+    partial = Path(tmp)
+    try:
+        def _write():
+            out = os.open(tmp, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+            with os.fdopen(out, "wb") as dst_f, open(source, "rb") as src_f:
+                shutil.copyfileobj(src_f, dst_f, SHA1_CHUNK_SIZE * 16)
+        retry_io_operation(f"Copying {source.name}", _write)
+        shutil.copystat(str(source), tmp)
+        _fsync_file(tmp)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            partial.unlink()
+        raise
+    return partial
+
+
 class DestinationExistsError(Exception):
     """
     Raised when the final destination name is already occupied at the moment
@@ -1552,42 +1693,50 @@ class DestinationExistsError(Exception):
 def _finalize_partial(partial_dest: Path, dest: Path):
     """
     Publishes the verified partial file under its final name WITHOUT ever
-    overwriting an existing file.
+    overwriting an existing file, then makes the new directory entry durable.
 
     Path.rename() cannot be used directly here: on POSIX it silently
     replaces an existing destination, so a same-named file already sitting
     at `dest` would be destroyed with no error raised and no record kept.
-    os.link() is the atomic alternative — it fails with FileExistsError
-    rather than clobbering — and since the partial always lives in the same
-    directory as its final name, it is always on the same filesystem.
+    os.link() is the no-overwrite alternative — it fails with
+    FileExistsError rather than clobbering — and since the partial always
+    lives in the same directory as its final name, it never crosses
+    filesystems.
 
-    Filesystems that cannot hard-link (FAT/exFAT on external drives, some
-    network shares) fall back to an explicit existence check plus rename.
-    That leaves a narrow TOCTOU window, but only against a process outside
-    this engine — the single-instance lock plus this loop being serial rules
-    out racing ourselves.
+    Only a filesystem that genuinely cannot hard-link (FAT/exFAT, some
+    network shares — see _NO_HARDLINK_ERRNOS) falls back to an existence
+    check plus rename(). That fallback leaves a window in which a file
+    appearing at `dest` from outside this engine would be replaced, so it is
+    used for nothing else: any other link failure (an I/O error, a full
+    disk) fails the publish rather than quietly weakening the guarantee.
     """
     try:
         os.link(str(partial_dest), str(dest))
     except FileExistsError:
         raise DestinationExistsError(f"Destination already exists, refusing to overwrite: {dest}")
-    except OSError:
+    except OSError as e:
+        if e.errno not in _NO_HARDLINK_ERRNOS:
+            raise
         if dest.exists():
             raise DestinationExistsError(f"Destination already exists, refusing to overwrite: {dest}")
         partial_dest.rename(dest)
-        return
-    partial_dest.unlink()
+    else:
+        partial_dest.unlink()
+    _fsync_directory(dest.parent)
 
 
 
 def copy_verify_delete(source_str: str, dest_str: str, delete_source: bool = True) -> tuple:
     """
-    Copies source to dest via a verified temp-file-then-rename sequence.
-    delete_source=True (the --move behavior): source is deleted only
-    after the copy is verified byte-for-byte identical — this is the
-    Copy-Verify-Delete protocol from spec §4.3.
-    delete_source=False (the --copy behavior): the copy is still verified
-    the same way, but the source file is left untouched — non-destructive.
+    Copies source to dest via a staged, verified, no-overwrite publish.
+
+    Stage into a unique partial beside the destination and fsync it; verify
+    its SHA-1 against the source's; publish it with a no-overwrite link and
+    fsync the directory. delete_source=True (the --move behavior) then hands
+    the source to _remove_verified_source(), which deletes it only if the
+    copy is a separate, durable file and the source is unchanged since the
+    copy began. delete_source=False (the --copy behavior) stops after
+    publishing — non-destructive.
 
     Returns (success: bool, error_message: Optional[str]) — the message is
     None on success, and a human-readable description of what failed
@@ -1596,11 +1745,14 @@ def copy_verify_delete(source_str: str, dest_str: str, delete_source: bool = Tru
     """
     source = Path(source_str)
     dest = Path(dest_str)
-    partial_dest = Path(dest_str + PARTIAL_SUFFIX)
+    partial_dest = None
 
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
-        retry_io_operation(f"Copying {source.name}", shutil.copy2, source, partial_dest)
+        # Taken BEFORE the copy, so any edit from here on — during the copy,
+        # during verification, after publishing — is visible at deletion time.
+        source_identity = _file_identity(source)
+        partial_dest = _stage_copy(source, dest)
 
         src_sha1 = compute_sha1(str(source))
         partial_sha1 = compute_sha1(str(partial_dest))
@@ -1608,14 +1760,20 @@ def copy_verify_delete(source_str: str, dest_str: str, delete_source: bool = Tru
         if src_sha1 != partial_sha1:
             error_message = f"ChecksumMismatch: SHA1 verification failed for {source.name}"
             logger.error(error_message)
-            if partial_dest.exists():
-                partial_dest.unlink()
+            partial_dest.unlink()
             return False, error_message
 
         _finalize_partial(partial_dest, dest)
+        partial_dest = None  # published: nothing left to clean up
 
         if delete_source:
-            retry_io_operation(f"Delete original {source.name}", source.unlink)
+            try:
+                _remove_verified_source(source, dest, source_identity,
+                                        f"Delete original {source.name}")
+            except SourceRemovalRefused as e:
+                error_message = f"Copied and verified, but the source was kept: {e}"
+                logger.warning(f"{error_message} ({source_str})")
+                return False, error_message
             logger.info(f"Successfully migrated: {source.name} -> {dest}")
         else:
             logger.info(f"Successfully copied: {source.name} -> {dest} (source untouched)")
@@ -1623,11 +1781,9 @@ def copy_verify_delete(source_str: str, dest_str: str, delete_source: bool = Tru
     except Exception as e:
         error_message = f"{type(e).__name__}: {e}"
         logger.error(f"Failed transactional copy for {source_str}: {error_message}")
-        if partial_dest.exists():
-            try:
+        if partial_dest is not None:
+            with contextlib.suppress(OSError):
                 partial_dest.unlink()
-            except Exception:
-                pass
         return False, error_message
 
 
@@ -1846,6 +2002,31 @@ def is_hidden_path(path: Path, root: Path) -> bool:
     except ValueError:
         relative = Path(path.name)
     return any(part.startswith('.') for part in relative.parts)
+
+
+def describe_root_overlap(source: Path, dest: Path) -> Optional[str]:
+    """
+    Explains how two RESOLVED roots overlap, or returns None if they do not.
+
+    Detects what the paths and the kernel can show: one path, one nested in
+    the other (symlinks are already resolved by the caller), and one directory
+    reachable at two paths, such as a bind mount, via samefile(). Two separate
+    network mounts of one export appear as different devices and are NOT
+    detected — which is why _remove_verified_source() also refuses per file,
+    and why overlapping storage stays documented as unsupported.
+    """
+    if source == dest:
+        return f"both are {source}"
+    if dest.is_relative_to(source):
+        return f"the destination {dest} is inside the source {source}"
+    if source.is_relative_to(dest):
+        return f"the source {source} is inside the destination {dest}"
+    try:
+        if dest.exists() and os.path.samefile(source, dest):
+            return f"{source} and {dest} are the same directory reached by two paths"
+    except OSError:
+        pass
+    return None
 
 
 def discover_source_files(root: Path, extensions: set) -> List[str]:
@@ -2121,6 +2302,22 @@ def main():
         logger.error(f"Source path does not exist: {source_path}")
         release_single_instance_lock(lock_fd)
         return
+
+    # Source and destination must be separate storage. When they are one
+    # folder, or one contains the other, a file already in its date folder has
+    # its own path as its computed destination: the already-present check
+    # hashes the file against itself, matches, and --move deletes the only
+    # copy while reporting success. Refused for every mode — overlapping roots
+    # are unsupported whatever the run would have done.
+    overlap = describe_root_overlap(source_path, dest_path)
+    if overlap:
+        logger.error(
+            f"FATAL: source and destination overlap — {overlap}. They must be separate, "
+            f"non-overlapping folders; check the host folders behind the container mounts. "
+            f"Nothing was changed."
+        )
+        release_single_instance_lock(lock_fd)
+        sys.exit(1)
 
     # --source-subdir scopes targeting to already-indexed rows under this
     # path, rather than re-walking the filesystem or enumerating IDs. Resolve
@@ -2448,12 +2645,16 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
         # operations reporting success. By this point in the run, anything
         # already written is really on disk, so exists() answers truthfully.
         already_present = False
+        source_identity = None
         resolved_path = Path(dst)
         if resolved_path.exists():
             # Only hash when the name is actually contested — the common case
             # (free name) pays nothing. The source is re-hashed live rather
             # than trusting the indexed value, so a source edited since the
-            # last Index can never be mistaken for "already delivered."
+            # last Index can never be mistaken for "already delivered." Its
+            # identity is taken first, so an edit after hashing is caught too.
+            with contextlib.suppress(OSError):
+                source_identity = _file_identity(src)
             resolved_path, already_present = resolve_destination(Path(dst), _sha1_of(Path(src)))
         resolved_dst = str(resolved_path)
         has_collision = (resolved_dst != dst)
@@ -2470,9 +2671,16 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
             logger.info(f"Already present at destination, skipping copy: {Path(src).name} -> {resolved_dst}")
             if args.move:
                 try:
-                    retry_io_operation(f"Delete already-copied source {Path(src).name}", Path(src).unlink)
+                    if source_identity is None:
+                        raise SourceRemovalRefused("the source could not be examined before verification")
+                    _remove_verified_source(Path(src), resolved_path, source_identity,
+                                            f"Delete already-copied source {Path(src).name}")
                     final_status = PhotoStatus.COMPLETED
                     skip_error = None
+                except SourceRemovalRefused as e:
+                    final_status = PhotoStatus.FAILED
+                    skip_error = f"Source kept: {e}"
+                    logger.warning(f"{skip_error} ({src})")
                 except Exception as e:
                     final_status = PhotoStatus.FAILED
                     skip_error = f"{type(e).__name__}: {e}"
@@ -2590,6 +2798,7 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
             # permission error or an I/O fault is an absence of evidence, not
             # evidence of a good copy.
             try:
+                source_identity = _file_identity(dup_src)
                 source_sha1 = compute_sha1(dup_src_str)
                 verified = None
                 read_error = None
@@ -2618,16 +2827,27 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
                 continue
 
             try:
-                retry_io_operation(f"Deleting verified duplicate {dup_src.name}", dup_src.unlink)
-                cursor.execute("UPDATE photos SET status = ?, dest_path = ? WHERE id = ?",
-                               (PhotoStatus.REMOVED_DUPLICATE, verified, record_id))
-                conn.commit()
-                removed_count += 1
-                logger.info(f"Removed duplicate source file: {dup_src} (verified copy at {verified})")
-                log_operation(conn, run_id, record_id, dup_src_str, verified,
-                              PhotoStatus.REMOVED_DUPLICATE)
+                _remove_verified_source(dup_src, Path(verified), source_identity,
+                                        f"Deleting verified duplicate {dup_src.name}")
             except Exception as e:
-                logger.error(f"Failed to remove duplicate source file {dup_src}: {e}")
+                # Recorded like a verification failure, for the same reason:
+                # the source stays, and the operations row is the only thing
+                # the Error Center can read to say why.
+                if isinstance(e, SourceRemovalRefused):
+                    error_message = f"Source kept: {e}"
+                else:
+                    error_message = f"Duplicate removal failed: {type(e).__name__}: {e}"
+                logger.warning(f"{error_message} — {dup_src}")
+                log_operation(conn, run_id, record_id, dup_src_str, verified,
+                              PhotoStatus.FAILED, error_message)
+                continue
+            cursor.execute("UPDATE photos SET status = ?, dest_path = ? WHERE id = ?",
+                           (PhotoStatus.REMOVED_DUPLICATE, verified, record_id))
+            conn.commit()
+            removed_count += 1
+            logger.info(f"Removed duplicate source file: {dup_src} (verified copy at {verified})")
+            log_operation(conn, run_id, record_id, dup_src_str, verified,
+                          PhotoStatus.REMOVED_DUPLICATE)
 
         if duplicate_records:
             logger.info(f"Duplicate cleanup: removed {removed_count} of {len(duplicate_records)} flagged duplicates.")
