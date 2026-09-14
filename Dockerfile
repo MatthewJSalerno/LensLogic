@@ -25,6 +25,10 @@ RUN chmod +x /entrypoint.sh
 COPY ns-engine.py .
 RUN chmod 644 ns-engine.py
 
+# Source and destination MUST map to separate, non-overlapping underlying
+# folders. Never mount the same folder at both paths, or nest one in the other.
+# Different container paths do not ensure separate storage (including NFS).
+# Overlapping mounts are unsupported and can cause unintended file deletion.
 # Pre-create standard volume mount points
 RUN mkdir -p /data/source /data/dest /appdata/db /appdata/logs
 

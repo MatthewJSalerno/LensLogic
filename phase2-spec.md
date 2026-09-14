@@ -73,6 +73,10 @@ scoped to a specific selection via `--file-ids`.
 ### Action Mode Selection
 The UI allows switching between execution modes prior to triggering operations:
 * **Move Mode (`--move`):** Transactional Copy-Verify-Delete. Deletes source files only after SHA-1 checksum verification succeeds at destination.
+
+**No source file is ever deleted on the catalog's word alone.** All three places the engine removes a user file — the verified copy in Move, an already-delivered source it finds at the destination, and a duplicate source during cleanup — hash *both* files live at the moment of the decision. Stored hashes identify a candidate; they never authorize a deletion. A UI must not offer to relax this, and it needs no separate "verify before deleting" option, because there is no path that skips the check.
+
+One consequence for display: after a Move, each `Duplicate` row's `dest_path` is repointed at the location recording its content, and that step reads no files by design. A duplicate's recorded destination therefore means *where its content is recorded*, not *confirmed present and matching*. Do not present it as verified — the guarantee lives at the moment of deletion, not in the column.
 * **Copy Mode (`--copy`):** Non-destructive. Performs verified copy to destination while leaving source files untouched.
 
 ### Selective File Processing
@@ -214,6 +218,10 @@ Jobs run asynchronously in FastAPI. If a user closes or refreshes their browser,
 ### 5.3 Error Center
 If operations fail, an Error Banner highlights the failures, sourced directly from the `operations` log's `error_message` column (see §6.1) — the real exception text is persisted, not just a generic "failed" flag.
 
+**Failures belong to attempts, not to a photo's current status.** Query `operations.status = 'Failed'`, joining the photo and run for context; do not filter on `photos.status`. The two deliberately disagree in at least one case: when duplicate cleanup cannot verify that a destination copy still matches the source, it leaves the photo `Duplicate` — correct, since the source is intact and still a duplicate — while recording a `Failed` operation explaining why the deletion did not happen. An Error Center filtering on `photos.status` would show that photo as an ordinary duplicate and never surface the failure, which is the invisibility the recorded operation exists to end.
+
+For that case specifically, the recorded `error_message` reads `Duplicate verification failed: ...`, and the underlying cause is worth distinguishing in the UI: a `ChecksumMismatch` means the two files' contents differ, while an `OSError` means one of them could not be read and the comparison never happened. Neither should be presented as "the destination is a verified backup", and neither should suggest deleting anything by hand.
+
 ```
 +-----------------------------------------------------------------------------------+
 | FAILED OPERATIONS (3 Items)                                                       |
@@ -236,7 +244,7 @@ If operations fail, an Error Banner highlights the failures, sourced directly fr
 
 Users can view exact system error strings (e.g., `PermissionError`, `ChecksumMismatch`, `Source file changed`). The distinct wording on the third case (`project-spec.md` §4.2) is intentional — it should read differently from a permissions/disk failure, since the fix is "run an Index" rather than "check destination permissions."
 
-**No dedicated retry subsystem.** There is no "Retry Item" / "Retry All Failed" backend endpoint and no `retry_count` tracking. A failed file's `photos.status` is reset to `Pending` automatically the next time it's re-indexed (a plain re-scan, full or `--file-ids`-scoped), so retrying is just re-running the same operation — files that already succeeded are gone from `--source` and won't be touched again, so this is fast even for a large batch with only a few failures. The web UI's equivalent of "retry" is simply selecting the failed items (they're still visible with `status = 'Failed'`) and re-issuing the same Move/Copy operation via `POST /api/v1/jobs/start` with their IDs in `file_ids` — no new endpoint required.
+**No dedicated retry subsystem.** There is no "Retry Item" / "Retry All Failed" backend endpoint and no `retry_count` tracking. A failed file's `photos.status` is reset to `Pending` automatically the next time it's re-indexed (a plain re-scan, full or `--file-ids`-scoped), so retrying is just re-running the same operation — files that already succeeded are gone from `--source` and won't be touched again, so this is fast even for a large batch with only a few failures. The web UI's equivalent of "retry" is selecting the photos associated with failed attempts and re-issuing the same Move/Copy operation via `POST /api/v1/jobs/start` with their IDs in `file_ids` — no new endpoint required. Take those IDs from the failed `operations` rows rather than from `photos.status`, deduplicating when several attempts reference one photo, and do not require the photo's current status to be `Failed`: a duplicate-verification failure stays `Duplicate` and is retried by Move's duplicate cleanup on the next run. Retrying does not by itself fix a content mismatch or an unreadable file, so the UI should not promise that it will.
 
 ### 5.4 Operations Audit Log (`/logs`)
 A searchable table logging every operation performed by the engine:
@@ -321,7 +329,11 @@ The general principle: the engine guarantees it will never act on something it h
 
 ### 6.1 SQLite Schema
 
-Schema changes are versioned with SQLite's built-in `PRAGMA user_version`, but **there is no in-place upgrade path and none should be added**. The catalog is a derived artifact — every value in it is recomputable from the source files by running an Index — so a catalog recording a different version is refused at startup with instructions to delete and rebuild, rather than migrated. Migration code runs rarely, on real user data, along a path that is almost never exercised; the engine previously carried three migration branches and one had a latent bug that survived until someone read it closely.
+Schema changes are versioned with SQLite's built-in `PRAGMA user_version`, but **there is no in-place upgrade path and none should be added**. A catalog recording a different version is refused at startup with instructions to delete and rebuild, rather than migrated. Migration code runs rarely, on real user data, along a path that is almost never exercised; the engine previously carried three migration branches and one had a latent bug that survived until someone read it closely.
+
+**Only `photos` is derived. `runs` and `operations` are not, and rebuilding discards them.** Every value in `photos` is recomputable by re-running an Index over the same sources — verified by rebuilding a ~29,000-file catalog from scratch and getting identical per-status counts. Nothing recomputes the audit log: it records what the engine *did*, and re-scanning the filesystem cannot reconstruct it. The sharpest case is `Removed_Duplicate`, where after a `--move` that row is the only evidence the file ever existed — its source was deleted by design and its content survives only under the anchor's name.
+
+The practical consequence for the UI: rebuilding is cheap and safe for a catalog that has only been Indexed or Copied, and lossy for one that has been Moved against. Before offering a rebuild, check whether any `Removed_Duplicate` rows exist and say what will be lost. Offer a backup first — `sqlite3 <db> ".backup '<path>'"` is atomic under WAL where a file copy is not — and treat a JSON export of `runs` and `operations` as the format for reading history outside the app or carrying it across a schema change, not as a substitute for the database backup.
 
 **Status values are enforced by the database, not by convention.** Each `status` column carries a `CHECK` constraint listing exactly its vocabulary, generated from the same tuples the engine uses. An API write of `'copied'` or a filter on `'Complete'` fails loudly at write time rather than silently disagreeing with the engine — a mismatch whose only symptom would otherwise be photos that never appear. Treat the constraint as the contract and do not hardcode a parallel list; read it from the engine's constants or from `sqlite_master` if the API needs to enumerate.
 
@@ -580,9 +592,11 @@ Returns inspector details for a specific photo.
       ]
     }
 
-GET /api/v1/photos?status=Failed
+GET /api/v1/operations?status=Failed
 
-Fetches failed items for display in the Error Center (§5.3). "Retrying" is just selecting these IDs and calling `POST /api/v1/jobs/start` again with the same mode — no separate retry endpoint, per the design note in §5.3.
+Fetches failed attempts for the Error Center (§5.3), filtering on `operations.status`. Returns the operation ID, photo ID (nullable), run ID, timestamp, source and destination paths, status, error message, and the associated photo's current status as a separate field — the two are not interchangeable, per §5.3. Left-join the photo so a missing row cannot hide a failure. Supports run and date filters with stable ordering for pagination.
+
+`GET /api/v1/photos?status=Failed` remains available for filtering the catalog, but it is not the Error Center's data source: it misses any failure whose photo is not currently `Failed`. "Retrying" is selecting the associated photo IDs and calling `POST /api/v1/jobs/start` again with the same mode — no separate retry endpoint, per the design note in §5.3.
 
 ---
 

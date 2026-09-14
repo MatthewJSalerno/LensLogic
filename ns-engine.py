@@ -3,6 +3,11 @@ Project: NegativeSpace (Phase 1: Core Engine)
 Description: A backend engine for organizing large photo collections based on spec.
 
 Runtime Arguments:
+Source and destination must be separate, non-overlapping underlying folders.
+Never mount the same folder at both paths or nest one inside the other,
+including on network shares. Overlapping mounts can cause unintended file
+deletion and are not reliably detected by the engine.
+
 - --source <path> (Optional) Path to unorganized source directory (default: "/data/source").
 - --dest <path> (Optional) Path for organized output directory (default: "/data/dest").
 - --base <path> (Optional) Base directory for app artifacts (default: "/data").
@@ -2011,7 +2016,14 @@ def _query_source_subdir(db_path: str, subdir_filter_path: Path) -> List[str]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="NegativeSpace - Photo Collection Organizer (Phase 1 Engine)")
+    parser = argparse.ArgumentParser(
+        description="NegativeSpace - Photo Collection Organizer (Phase 1 Engine)",
+        epilog="WARNING: Source and destination must map to separate, non-overlapping underlying "
+               "folders, including on network shares. Never mount the same folder at both paths "
+               "or nest one inside the other. Different container paths do not ensure separate "
+               "storage. Overlapping mounts can cause unintended file deletion and are not "
+               "reliably detected by the engine."
+    )
     parser.add_argument("--source", default="/data/source", help="Path to source directory (default: /data/source).")
     parser.add_argument("--dest", default="/data/dest", help="Path to destination directory (default: /data/dest).")
     parser.add_argument("--base", default="/appdata", help="Base directory for DB and logs (default: /appdata).")
@@ -2528,7 +2540,9 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
         # separate mode check needed here. Skipped entirely if this run was
         # cancelled, since acting on duplicates from a run that didn't
         # finish its primary moves could delete a source file whose "kept"
-        # copy was itself never confirmed.
+        # copy was itself never confirmed. Every deletion below additionally
+        # requires live bytes on both sides to match — see the verification
+        # block.
         # Scoped to whatever this run targeted. Previously this swept the
         # WHOLE library regardless: a two-file --file-ids move would happily
         # delete duplicate source files nowhere near the user's selection.
@@ -2544,29 +2558,76 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
             if not dup_src.exists():
                 continue  # already gone (e.g. handled in a prior run)
 
+            # Every row recording a delivered copy of this content, not just
+            # the first. LIMIT 1 could pick a row whose file has since been
+            # edited or removed and conclude there is no copy, while another
+            # row names a copy that is still byte-perfect.
             cursor.execute(
-                f"SELECT dest_path FROM photos WHERE sha1_hash = ? "
-                f"AND status = '{PhotoStatus.COMPLETED}' LIMIT 1",
+                f"SELECT DISTINCT dest_path FROM photos WHERE sha1_hash = ? "
+                f"AND status = '{PhotoStatus.COMPLETED}' AND dest_path IS NOT NULL",
                 (sha1_hash,)
             )
-            match = cursor.fetchone()
-            if match and Path(match[0]).exists():
-                try:
-                    retry_io_operation(f"Deleting verified duplicate {dup_src.name}", dup_src.unlink)
-                    cursor.execute("UPDATE photos SET status = ? WHERE id = ?",
-                                   (PhotoStatus.REMOVED_DUPLICATE, record_id))
-                    conn.commit()
-                    removed_count += 1
-                    logger.info(f"Removed duplicate source file: {dup_src} (verified copy at {match[0]})")
-                    log_operation(conn, run_id, record_id, dup_src_str, match[0],
-                                  PhotoStatus.REMOVED_DUPLICATE)
-                except Exception as e:
-                    logger.error(f"Failed to remove duplicate source file {dup_src}: {e}")
-            else:
+            candidates = [row[0] for row in cursor.fetchall()]
+            if not candidates:
                 logger.warning(
                     f"No verified copy found on disk for duplicate {dup_src} — "
                     f"leaving source file in place for safety."
                 )
+                continue
+
+            # Verify LIVE BYTES on both sides before deleting anything.
+            #
+            # The catalog's hashes identify candidates; they do not prove the
+            # files still match. Either side can have changed since the Index
+            # that recorded them — the source edited in place, or the
+            # destination copy modified or truncated by something outside this
+            # engine — and the previous code checked only that the destination
+            # path existed. A file that exists is not a file that matches, so
+            # an edited destination was enough to authorize deleting the last
+            # remaining copy of a photo.
+            #
+            # An unreadable candidate must never count as a match either: a
+            # permission error or an I/O fault is an absence of evidence, not
+            # evidence of a good copy.
+            try:
+                source_sha1 = compute_sha1(dup_src_str)
+                verified = None
+                read_error = None
+                for candidate in candidates:
+                    try:
+                        if compute_sha1(candidate) == source_sha1:
+                            verified = candidate
+                            break
+                    except OSError as e:
+                        read_error = e
+                if verified is None:
+                    if read_error is not None:
+                        raise read_error
+                    raise ValueError(
+                        "ChecksumMismatch: duplicate source and destination no longer match"
+                    )
+            except Exception as e:
+                # Recorded, not merely logged. The photo stays Duplicate so a
+                # later run can retry it once the cause is addressed, and the
+                # operations row is what the Error Center reads — a warning in
+                # the log is invisible to it.
+                error_message = f"Duplicate verification failed: {type(e).__name__}: {e}"
+                logger.warning(f"{error_message} — leaving source file in place: {dup_src}")
+                log_operation(conn, run_id, record_id, dup_src_str, candidates[0],
+                              PhotoStatus.FAILED, error_message)
+                continue
+
+            try:
+                retry_io_operation(f"Deleting verified duplicate {dup_src.name}", dup_src.unlink)
+                cursor.execute("UPDATE photos SET status = ?, dest_path = ? WHERE id = ?",
+                               (PhotoStatus.REMOVED_DUPLICATE, verified, record_id))
+                conn.commit()
+                removed_count += 1
+                logger.info(f"Removed duplicate source file: {dup_src} (verified copy at {verified})")
+                log_operation(conn, run_id, record_id, dup_src_str, verified,
+                              PhotoStatus.REMOVED_DUPLICATE)
+            except Exception as e:
+                logger.error(f"Failed to remove duplicate source file {dup_src}: {e}")
 
         if duplicate_records:
             logger.info(f"Duplicate cleanup: removed {removed_count} of {len(duplicate_records)} flagged duplicates.")
@@ -2599,7 +2660,16 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
             predicate_params
         )
         if cursor.rowcount:
-            logger.info(f"Repointed {cursor.rowcount} duplicate record(s) at the verified copy they match.")
+            # Deliberately does NOT say "verified". This step only rewrites a
+            # pointer from the catalog; it reads no files. The one place that
+            # acts destructively on that pointer — duplicate cleanup above —
+            # hashes both sides live before deleting anything, and that is
+            # where the guarantee lives. Claiming verification here would be
+            # the same overstatement this function's caller exists to prevent.
+            logger.info(
+                f"Repointed {cursor.rowcount} duplicate record(s) at the destination recorded "
+                f"for their content."
+            )
         conn.commit()
 
     conn.close()

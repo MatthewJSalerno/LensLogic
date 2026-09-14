@@ -47,6 +47,7 @@ To balance heavy-duty data processing with a high-quality user experience, the a
 
 ## 4. Functional Requirements
 ### 4.1. Input & Configuration
+*   **Source/destination separation:** The underlying source and destination folders must be distinct and non-overlapping: neither may contain the other. Different container paths are insufficient if their host folders or network-share mappings overlap. This applies to local storage and NFS alike. Overlapping mounts are unsupported and can cause unintended processing or deletion. Document this deployment requirement; do not promise automatic detection of every mount alias.
 *   **Path Definitions:** `--source` (default `/data/source`), `--dest` (default `/data/dest`), and `--base` (default `/appdata`, holding `<base>/db/ns_sqlite.db` and `<base>/logs/organizer.log`).
 *   **Tuning:**
     *   `--workers <N>` — overrides the `ProcessPoolExecutor` worker count (default: `os.cpu_count()`).
