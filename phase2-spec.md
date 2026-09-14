@@ -75,6 +75,18 @@ The UI allows switching between execution modes prior to triggering operations:
 * **Move Mode (`--move`):** Transactional Copy-Verify-Delete. Deletes source files only after SHA-1 checksum verification succeeds at destination.
 * **Copy Mode (`--copy`):** Non-destructive. Performs verified copy to destination while leaving source files untouched.
 
+### Verify Destination Integrity (optional, user-initiated)
+
+Offer an explicit **Verify destination** action, separate from any Move or Copy. It hashes the destination files the catalog says should exist and reports what is intact, changed, or missing. This answers a question users actually have — *is my organized library still what NegativeSpace put there?* — which nothing else in the product answers.
+
+**It is an integrity report, never a safety toggle.** Duplicate cleanup already hashes both source and destination live immediately before deleting any source file, unconditionally, and that must not become an option the user can switch off: doing so would restore the behavior where an edited destination copy was enough to authorize deleting the last intact original. What this action adds is confidence about the destination as a whole, not permission to skip a check.
+
+The related catalog step it does illuminate is duplicate repointing, which after a Move rewrites each `Duplicate` row's `dest_path` to the location recording its content. That step reads no files by design — it moves a pointer, and every destructive use of that pointer verifies independently. So a duplicate's recorded destination means *where its content should be*, not *confirmed present and matching*. The UI should not imply otherwise unless a verification pass has actually run, and should show when the last one did.
+
+Warn about the cost using the real byte total rather than a generic caution: the work is proportional to the size of the files being checked, which the catalog already knows from `file_size`. On a library of roughly 3,000 duplicates averaging 4 MB this is around 12 GB of reads — a couple of minutes against a local disk, longer across a network mount. Show the estimate before starting, and make it cancellable.
+
+Results are reported, never acted on. Nothing under the destination is deleted or modified by this action, consistent with the engine's invariant (`phase3-spec.md` §3).
+
 ### Selective File Processing
 Users can select individual files or multiple files across grid views to run targeted operations.
 * **Multi-Select Controls:** Checkboxes on photo cards, Shift-click range selections, and "Select all on page."

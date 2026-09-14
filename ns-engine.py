@@ -2660,7 +2660,16 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
             predicate_params
         )
         if cursor.rowcount:
-            logger.info(f"Repointed {cursor.rowcount} duplicate record(s) at the verified copy they match.")
+            # Deliberately does NOT say "verified". This step only rewrites a
+            # pointer from the catalog; it reads no files. The one place that
+            # acts destructively on that pointer — duplicate cleanup above —
+            # hashes both sides live before deleting anything, and that is
+            # where the guarantee lives. Claiming verification here would be
+            # the same overstatement this function's caller exists to prevent.
+            logger.info(
+                f"Repointed {cursor.rowcount} duplicate record(s) at the destination recorded "
+                f"for their content."
+            )
         conn.commit()
 
     conn.close()
