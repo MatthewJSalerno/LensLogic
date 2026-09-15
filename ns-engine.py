@@ -138,6 +138,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import logging.handlers
 import warnings
 import multiprocessing as mp
 import os
@@ -448,6 +449,26 @@ result_queue = queue.Queue(maxsize=DB_QUEUE_SIZE)
 
 
 # --- Logging Initialization ---
+# The log rotates only at startup, in the process holding the single-instance
+# lock (rotate_log_if_large), never by size mid-write: every worker process
+# holds the same file open, and a rotation by one of them would leave the rest
+# writing into the renamed file. One run's log is therefore never split, and
+# the total is bounded by these plus one run's output.
+LOG_ROTATE_BYTES = 50 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
+
+
+def rotate_log_if_large():
+    """Rotates organizer.log once it exceeds LOG_ROTATE_BYTES. Call only while holding the lock."""
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, logging.handlers.RotatingFileHandler):
+            try:
+                if os.path.getsize(handler.baseFilename) > LOG_ROTATE_BYTES:
+                    handler.doRollover()
+            except OSError as e:
+                logger.warning(f"Could not rotate {handler.baseFilename}: {e}")
+
+
 def configure_logging(log_dir: Path):
     """
     Points logging at the console and <base>/logs/organizer.log.
@@ -478,7 +499,10 @@ def configure_logging(log_dir: Path):
         format='%(asctime)s [%(levelname)s] (pid:%(process)d/%(threadName)s) %(message)s',
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler(log_file, mode="a", encoding="utf-8")
+            # maxBytes=0: never rotates on write; see rotate_log_if_large.
+            logging.handlers.RotatingFileHandler(
+                log_file, mode="a", maxBytes=0, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"
+            )
         ]
     )
 
@@ -1309,14 +1333,9 @@ def _shutdown_worker_exiftool():
         try:
             # Bounded: ProcessPoolExecutor's shutdown waits for every worker,
             # and this runs via atexit in each of them, so an ExifTool process
-            # that will not exit stalls the whole run's teardown. PyExifTool
-            # defaults to a 30s wait per instance, which across several workers
-            # and several back-to-back invocations is long enough to look
-            # indistinguishable from a hang.
-            try:
-                _worker_exiftool.terminate(wait_timeout=5)
-            except TypeError:
-                _worker_exiftool.terminate()
+            # that will not exit stalls the whole run's teardown. PyExifTool's
+            # default is a 30 s wait per instance.
+            _worker_exiftool.terminate(timeout=5)
         except Exception:
             pass
         _worker_exiftool = None
@@ -2374,6 +2393,10 @@ def main():
     # touching the database or source/dest paths at all. Applies to every
     # mode, including Index, not just --move/--copy.
     lock_fd = acquire_single_instance_lock(base_dir)
+    if lock_fd is not None:
+        # Only the lock holder rotates: a rejected second instance must not
+        # rename the running engine's log out from under it.
+        rotate_log_if_large()
     if lock_fd is None:
         logger.error(
             f"FATAL: another NegativeSpace engine process is already running against --base {base_dir} "

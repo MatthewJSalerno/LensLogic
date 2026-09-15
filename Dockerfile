@@ -1,4 +1,7 @@
-FROM python:3.11-slim
+# Pinned by digest, with requirements.txt pinned to exact versions, so a
+# rebuild produces the image that was validated. Update deliberately: change
+# the digest, rebuild, run CI, and validate before merging.
+FROM python:3.11-slim@sha256:9534e5a8e315485d4061ed659af0fd78a284c015f9b73661b41d6bab25604534
 
 # Install system dependencies (ExifTool, gosu, tzdata, and build essentials for
 # pillow-heif). tzdata is required for -e TZ=<zone> to have any effect: without
