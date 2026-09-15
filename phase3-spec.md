@@ -46,6 +46,15 @@ Keying history on `sha1_hash` rather than `photos.id` would let it survive a reb
 
 Worth considering alongside: whether `runs` and `operations` belong in the rebuildable catalog at all, or in a separate store that is never discarded. That would remove the tension directly rather than working around it, at the cost of a second database file and cross-file joins the API layer would have to do itself.
 
+### 3.3 Idea: Choosing a Filename from a Duplicate Group
+
+When duplicates are removed, the surviving copy keeps its own filename — which may be the least descriptive name in its group. A camera-style `20051001.JPG` can survive while the duplicate removed against it was named something like `birthday_party.jpg`. Offer a way to rename a delivered file at the destination to the name any member of its duplicate group once had.
+
+* **The data already exists.** Every source path in a group is recorded and kept after a move or duplicate removal: `photos.source_path` on the `Duplicate`/`Removed_Duplicate` rows, and `operations.source_path` for every attempt, grouped by `sha1_hash`. No new capture is needed — provided the catalog is kept, since it is the only record of those names once the sources are gone (see §3.2).
+* **User-chosen, never automatic.** Which name is more meaningful is a judgement; the UI offers the group's names as candidates and the user picks.
+* **Keep the file's real extension.** Use the chosen name's stem with the delivered file's actual extension, so a rename never mislabels a file's format.
+* **This is a new kind of destination write.** Everything to date only adds files under `--dest`; this changes an existing one. It must be no-overwrite (link-then-unlink, or a no-replace rename) with the same `_N` suffix rule on a collision; it must update `photos.dest_path`; and it must record an operation carrying both the old and new path, so a photo's history still leads to where it is now. Removing the old *name* does not remove content, so the invariant that nothing under `--dest` is deleted still holds.
+
 ## 4. Open Design Questions for Phase 3
 
 These weren't resolved in the original draft and need scoping before implementation:
