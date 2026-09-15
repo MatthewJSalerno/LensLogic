@@ -849,6 +849,13 @@ def put_result(result, db_thread: threading.Thread):
 
 
 # --- Database Consumer (Thread) ---
+# Scan results the writer could not persist, as (path, reason). Filled by
+# db_writer_worker and read by main() once the writer has been joined: a run
+# whose catalog writes failed must neither report success nor go on to move
+# or copy files against a catalog that does not reflect what was scanned.
+writer_failures: List[tuple] = []
+
+
 def db_writer_worker(db_path: str):
     """
     The Consumer: only this thread touches SQLite during scanning.
@@ -868,6 +875,7 @@ def db_writer_worker(db_path: str):
     """
     conn = get_db_connection(db_path)
     cursor = conn.cursor()
+    writer_failures.clear()
     logger.info("Database worker thread started.")
 
     pending_writes = 0
@@ -892,6 +900,12 @@ def db_writer_worker(db_path: str):
                 conn.commit()
                 pending_writes = 0
         except Exception as e:
+            # The whole batch is lost, not just unacknowledged: roll it back so
+            # the connection is usable again, and record the loss so main()
+            # fails the run instead of reporting a catalog it does not have.
+            with contextlib.suppress(Exception):
+                conn.rollback()
+            writer_failures.append((f"(batch of {pending_writes} row(s))", f"commit failed: {e}"))
             logger.error(f"DB writer failed to commit a batch of {pending_writes} row(s): {e}")
             pending_writes = 0
         last_flush = time.monotonic()
@@ -919,6 +933,15 @@ def db_writer_worker(db_path: str):
         # script hung forever with no error surfaced. Now a single bad file
         # is logged and skipped instead of taking down the run.
         try:
+            # Each scan result is one unit: its catalog row and its audit entry
+            # are written together or not at all. The savepoint nests inside
+            # the batch transaction, so a failure undoes only this file's
+            # partial writes and the rest of the batch still commits. BEGIN is
+            # explicit because releasing an OUTERMOST savepoint would commit.
+            if not conn.in_transaction:
+                conn.execute("BEGIN")
+            conn.execute("SAVEPOINT scan_row")
+
             # FIX: exclude the file's own previous row from the duplicate
             # check ("source_path != ?"), AND exclude rows that are
             # themselves already Duplicate/Removed_Duplicate. Without the
@@ -990,6 +1013,9 @@ def db_writer_worker(db_path: str):
                 conn, result.run_id, photo_id, result.file_path, result.dest_path, status,
                 result.error_message, result.has_name_collision, commit=False
             )
+            conn.execute("RELEASE scan_row")
+
+            # Counted only once the row is safely in the batch.
             source = result.metadata.get("date_source") if result.metadata else None
             if source in date_sources:
                 date_sources[source] += 1
@@ -1003,6 +1029,16 @@ def db_writer_worker(db_path: str):
             ):
                 flush()
         except Exception as e:
+            # Undo this row's partial writes, keep the rest of the batch, and
+            # remember the failure: main() fails the run and skips the
+            # physical phase rather than acting on a catalog it could not
+            # update. A status the CHECK constraints reject lands here too,
+            # which is what makes those constraints fail loudly rather than
+            # into a single log line.
+            with contextlib.suppress(Exception):
+                conn.execute("ROLLBACK TO scan_row")
+                conn.execute("RELEASE scan_row")
+            writer_failures.append((result.file_path, f"{type(e).__name__}: {e}"))
             logger.error(f"DB writer failed to record {result.file_path}: {e}")
         finally:
             result_queue.task_done()
@@ -1045,17 +1081,27 @@ def db_writer_worker(db_path: str):
         logger.info(f"Date sources: {from_exif} from EXIF, {from_mtime} from file modification time.")
     if from_mtime:
         logger.warning(
-            f"{from_mtime} file(s) had no usable EXIF date and were filed by modification time. "
-            f"Those dates are interpreted in this container's timezone (logged above) — "
-            f"pass -e TZ=<zone> if the folders look a day off."
+            f"{from_mtime} file(s) had no usable EXIF date, so their date folder was chosen from "
+            f"the file's modification time. The files themselves are not changed. Those times "
+            f"are interpreted in this container's timezone (logged above) — pass -e TZ=<zone> "
+            f"if the folders look a day off."
         )
     conn.close()
     logger.info("Database worker thread shut down cleanly.")
 
 
 # --- Startup Recovery & Reconciliation ---
-def reconcile_interrupted_state(db_path: Path):
-    """Scans for leftover partials or uncommitted state from crashes prior to run."""
+def reconcile_interrupted_state(db_path: Path, run_id: Optional[int] = None):
+    """
+    Settles work a previous run left mid-flight, and records what it
+    concluded as operations of run_id — the run doing the reconciling — so a
+    recovered outcome is never just a silently rewritten status.
+
+    Every path that deletes a source first marks its row Processing, with
+    dest_path naming the copy the delete relies on. A row whose destination
+    belongs to ANOTHER delivered row was being removed as a duplicate;
+    otherwise it was moving its own file. That decides what it becomes.
+    """
     if not db_path.exists():
         return
 
@@ -1069,11 +1115,12 @@ def reconcile_interrupted_state(db_path: Path):
             return
 
         cursor.execute(
-            f"SELECT id, source_path, dest_path FROM photos WHERE status = '{PhotoStatus.PROCESSING}'"
+            f"SELECT id, source_path, dest_path, sha1_hash FROM photos "
+            f"WHERE status = '{PhotoStatus.PROCESSING}'"
         )
         stuck_records = cursor.fetchall()
 
-        for record_id, src_str, dst_str in stuck_records:
+        for record_id, src_str, dst_str, sha1 in stuck_records:
             src = Path(src_str)
             dst = Path(dst_str)
 
@@ -1092,14 +1139,24 @@ def reconcile_interrupted_state(db_path: Path):
                 logger.warning(f"Found orphaned partial file: {Path(orphan).name}. Removing.")
                 os.unlink(orphan)
 
+            duplicate_removal = cursor.execute(
+                f"SELECT 1 FROM photos WHERE id != ? AND sha1_hash = ? AND dest_path = ? "
+                f"AND status IN ({sql_values(ANCHOR_DELIVERED_STATUSES)}) LIMIT 1",
+                (record_id, sha1, dst_str)
+            ).fetchone() is not None
+
             if dst.exists() and not src.exists():
-                logger.info(f"Reconciled completed move for record {record_id}: {dst.name}")
-                cursor.execute("UPDATE photos SET status = ? WHERE id = ?",
-                               (PhotoStatus.COMPLETED, record_id))
+                final = PhotoStatus.REMOVED_DUPLICATE if duplicate_removal else PhotoStatus.COMPLETED
+                note = (f"Recovered after an interrupted run: the source is gone and the "
+                        f"destination copy is present at {dst}.")
             else:
-                logger.info(f"Resetting interrupted record {record_id} to Pending.")
-                cursor.execute("UPDATE photos SET status = ? WHERE id = ?",
-                               (PhotoStatus.PENDING, record_id))
+                final = PhotoStatus.DUPLICATE if duplicate_removal else PhotoStatus.PENDING
+                note = ("Recovered after an interrupted run: the operation had not finished, "
+                        "so it will be retried.")
+            logger.info(f"Reconciled interrupted record {record_id} as {final}.")
+            cursor.execute("UPDATE photos SET status = ? WHERE id = ?", (final, record_id))
+            if run_id is not None:
+                log_operation(conn, run_id, record_id, src_str, dst_str, final, note, commit=False)
 
         # FIX: a run that was killed uncatchably (SIGKILL, OOM-kill, power
         # loss — anything that bypasses main()'s try/finally) never reaches
@@ -1113,7 +1170,9 @@ def reconcile_interrupted_state(db_path: Path):
         # accordingly.
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='runs';")
         if cursor.fetchone():
-            cursor.execute("SELECT id FROM runs WHERE status = ?", (RunStatus.RUNNING,))
+            # The reconciling run itself is Running and must not mark itself Crashed.
+            cursor.execute("SELECT id FROM runs WHERE status = ? AND id != ?",
+                           (RunStatus.RUNNING, run_id if run_id is not None else -1))
             orphaned_runs = cursor.fetchall()
             for (run_id,) in orphaned_runs:
                 logger.warning(f"Run #{run_id} was left 'Running' by an unclean shutdown — marking Crashed.")
@@ -2054,7 +2113,7 @@ def describe_root_overlap(source: Path, dest: Path) -> Optional[str]:
     return None
 
 
-def discover_source_files(root: Path, extensions: set) -> List[str]:
+def discover_source_files(root: Path, extensions: set, errors: Optional[list] = None) -> List[str]:
     """
     Walks `root` and returns the files worth scanning.
 
@@ -2095,10 +2154,17 @@ def discover_source_files(root: Path, extensions: set) -> List[str]:
                             found.append(entry.path)
                     except OSError as e:
                         logger.warning(f"Could not inspect {entry.path}: {e}")
+                        if errors is not None:
+                            errors.append((entry.path, f"Could not inspect during the scan: "
+                                                       f"{type(e).__name__}: {e}"))
         except OSError as e:
             # An unreadable directory must not abort the whole scan, for the
-            # same reason an unreadable file does not.
+            # same reason an unreadable file does not — but it must not vanish
+            # into the log either. `errors` lets the caller record it.
             logger.warning(f"Could not read directory {current}: {e}")
+            if errors is not None:
+                errors.append((current, f"Could not read this folder during the scan, so photos "
+                                        f"inside it were not examined: {type(e).__name__}: {e}"))
     return found
 
 
@@ -2187,6 +2253,17 @@ def normalize_extensions(raw: str) -> set:
     return extensions
 
 
+def positive_int(value: str) -> int:
+    """argparse type for --workers: zero or a negative count is an error, not the default."""
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"must be a whole number, got: {value}")
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got: {value}")
+    return number
+
+
 def parse_file_ids(value: str) -> List[int]:
     try:
         return [int(x.strip()) for x in value.split(',') if x.strip()]
@@ -2234,7 +2311,7 @@ def main():
     parser.add_argument("--dest", default="/data/dest", help="Path to destination directory (default: /data/dest).")
     parser.add_argument("--base", default="/appdata", help="Base directory for DB and logs (default: /appdata).")
     parser.add_argument(
-        "--workers", type=int, default=None,
+        "--workers", type=positive_int, default=None,
         help=f"Worker process count for hashing/date resolution (default: {MAX_WORKER_PROCESSES}, auto-detected CPU count)."
     )
     parser.add_argument(
@@ -2323,10 +2400,16 @@ def main():
     source_path = Path(args.source).resolve()
     dest_path = Path(args.dest).resolve()
 
+    # Invalid input is an error, not an empty success: the caller (the web UI,
+    # a script) reads the exit code, and exit 0 said "nothing to do".
     if not source_path.exists():
-        logger.error(f"Source path does not exist: {source_path}")
+        logger.error(f"FATAL: source path does not exist: {source_path}")
         release_single_instance_lock(lock_fd)
-        return
+        sys.exit(1)
+    if not source_path.is_dir():
+        logger.error(f"FATAL: source path is not a folder: {source_path}")
+        release_single_instance_lock(lock_fd)
+        sys.exit(1)
 
     # Source and destination must be separate storage. When they are one
     # folder, or one contains the other, a file already in its date folder has
@@ -2396,7 +2479,6 @@ def main():
         logger.error(f"FATAL: {e}")
         release_single_instance_lock(lock_fd)
         sys.exit(1)
-    reconcile_interrupted_state(db_path)
 
     # 4. Register cancellation handlers and open the run record. Everything
     # from here down is wrapped in try/except/finally so the `runs` row is
@@ -2408,6 +2490,9 @@ def main():
     run_id = start_run(
         str(db_path), mode_label, str(source_path), str(dest_path), args.file_ids, args.source_subdir
     )
+    # Reconciled AFTER the run exists, so what it concludes is recorded as
+    # operations of this run rather than as silently rewritten statuses.
+    reconcile_interrupted_state(db_path, run_id)
     run_outcome = RunStatus.FAILED
 
     try:
@@ -2458,11 +2543,25 @@ def main():
             candidates = _query_source_subdir(str(db_path), subdir_filter_path)
             logger.info(f"Targeting {len(candidates)} already-indexed file(s) under source subdirectory.")
         else:
-            candidates = discover_source_files(source_path, active_extensions)
+            discovery_errors: List[tuple] = []
+            candidates = discover_source_files(source_path, active_extensions, errors=discovery_errors)
             logger.info(
                 f"Discovered {len(candidates):,} supported photo/image files "
                 f"(extensions: {', '.join(sorted(active_extensions))})."
             )
+            if discovery_errors:
+                record_run_failures(str(db_path), run_id, discovery_errors)
+                logger.warning(
+                    f"{len(discovery_errors)} folder(s) or file(s) could not be read during the scan; "
+                    f"each is recorded as a failure of this run."
+                )
+            # Only a full walk can say what is no longer there.
+            vanished = mark_vanished_sources(str(db_path), run_id, source_path, candidates)
+            if vanished:
+                logger.warning(
+                    f"{vanished:,} catalogued file(s) under {source_path} no longer exist; recorded as "
+                    f"Failed so any duplicates of them can stand in as the original."
+                )
 
         # A targeting mode that matches nothing is a user-visible mistake, not
         # a successful no-op. Both targeted modes read the CATALOG rather than
@@ -2574,6 +2673,7 @@ def main():
         db_thread.join(timeout=60)
         if db_thread.is_alive():
             logger.error("Database writer did not shut down within 60s — continuing without it.")
+            writer_failures.append(("(database writer)", "did not shut down within 60s"))
 
         if cancel_requested.is_set():
             logger.info(
@@ -2581,6 +2681,14 @@ def main():
                 f"Everything already indexed is saved; re-run to continue."
             )
             run_outcome = RunStatus.CANCELLED
+        elif writer_failures:
+            first_path, first_reason = writer_failures[0]
+            logger.error(
+                f"{len(writer_failures):,} scan result(s) could not be recorded in the catalog "
+                f"(first: {first_path} — {first_reason}). The catalog does not reflect this scan, "
+                f"so no files will be moved or copied. Nothing was changed on disk."
+            )
+            run_outcome = RunStatus.FAILED
         else:
             gb = bytes_done / 1e9
             elapsed = time.monotonic() - scan_started_at
@@ -2614,6 +2722,70 @@ def main():
         finish_run(str(db_path), run_id, run_outcome)
         logger.info(f"Run #{run_id} finished with status: {run_outcome}")
         release_single_instance_lock(lock_fd)
+
+    # A failed run is an error to whatever invoked the engine, not a success
+    # with a sad log line. Phase 2 reads the exit code as well as the record.
+    if run_outcome == RunStatus.FAILED:
+        sys.exit(1)
+
+
+def record_run_failures(db_path: str, run_id: int, failures: List[tuple]):
+    """Records (path, reason) failures that belong to the run rather than to any catalogued photo."""
+    conn = get_db_connection(db_path)
+    try:
+        for path, reason in failures:
+            log_operation(conn, run_id, None, path, None, PhotoStatus.FAILED, reason, commit=False)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_vanished_sources(db_path: str, run_id: int, root: Path, discovered: List[str]) -> int:
+    """
+    After a full walk of `root`, marks catalogued Pending/Duplicate files that
+    no longer exist as Failed, with a recorded reason. Returns how many.
+
+    A full Index only updates the files it finds, so a photo deleted outside
+    the engine kept its row Pending indefinitely — and went on standing as
+    the original of its duplicate group, so the duplicate was never
+    delivered. Failed rows take no part in duplicate grouping, which lets the
+    reclassification that follows promote a surviving duplicate.
+
+    A file counts as gone only when stat() says it does not exist. Anything
+    else — a permission error, an I/O fault, an --exts filter that simply did
+    not list it — leaves the row alone: unreadable is not absent.
+    """
+    seen = set(discovered)
+    clause, params = _path_prefix_clause(root)
+    conn = get_db_connection(db_path)
+    try:
+        rows = conn.execute(
+            f"SELECT id, source_path, dest_path FROM photos "
+            f"WHERE status IN ({sql_values((PhotoStatus.PENDING, PhotoStatus.DUPLICATE))})" + clause,
+            params
+        ).fetchall()
+        gone = []
+        for row_id, path, dest in rows:
+            if path in seen:
+                continue
+            try:
+                os.stat(path)
+            except (FileNotFoundError, NotADirectoryError):
+                gone.append((row_id, path, dest))
+            except OSError:
+                continue
+        for row_id, path, dest in gone:
+            conn.execute("UPDATE photos SET status = ? WHERE id = ?", (PhotoStatus.FAILED, row_id))
+            log_operation(
+                conn, run_id, row_id, path, dest, PhotoStatus.FAILED,
+                f"Source file changed: no longer found at {path}. It may have been moved, renamed, "
+                f"or deleted outside NegativeSpace since the last Index.",
+                commit=False
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return len(gone)
 
 
 def _is_under(path: str, root: Path) -> bool:
@@ -2861,6 +3033,13 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
             # errors it explains makes the log read backwards.
             logger.info(f"Already present at destination, skipping copy: {label} -> {resolved_dst}")
             if args.move:
+                # Intent first, as the copy path does. Deleting before
+                # recording meant a crash in between left the source gone and
+                # the row still claiming it was there; reconciliation settles
+                # rows it finds in Processing from what is actually on disk.
+                cursor.execute("UPDATE photos SET status = ?, dest_path = ? WHERE id = ?",
+                               (PhotoStatus.PROCESSING, resolved_dst, record_id))
+                conn.commit()
                 try:
                     if source_identity is None:
                         raise SourceRemovalRefused("the source could not be examined before verification")
@@ -2878,12 +3057,15 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
             else:
                 final_status = PhotoStatus.COPIED
                 skip_error = None
+            # The final state and its audit entry commit together, so a row can
+            # never read Completed without the operation that says so.
             cursor.execute(
                 "UPDATE photos SET status = ?, dest_path = ? WHERE id = ?",
                 (final_status, resolved_dst, record_id)
             )
+            log_operation(conn, run_id, record_id, src, resolved_dst, final_status, skip_error,
+                          has_collision, commit=False)
             conn.commit()
-            log_operation(conn, run_id, record_id, src, resolved_dst, final_status, skip_error, has_collision)
             continue
 
         if has_collision:
@@ -2932,8 +3114,9 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
         else:
             final_status = PhotoStatus.COPIED if success else PhotoStatus.FAILED
         cursor.execute("UPDATE photos SET status = ? WHERE id = ?", (final_status, record_id))
+        log_operation(conn, run_id, record_id, src, resolved_dst, final_status, error_message,
+                      has_collision, commit=False)
         conn.commit()
-        log_operation(conn, run_id, record_id, src, resolved_dst, final_status, error_message, has_collision)
 
     if args.move and not was_cancelled:
         # Duplicate source-file removal is a --move-only step. It's
@@ -2957,7 +3140,22 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
         )
         duplicate_records = cursor.fetchall()
         removed_count = 0
-        for record_id, dup_src_str, sha1_hash in duplicate_records:
+        for index, (record_id, dup_src_str, sha1_hash) in enumerate(duplicate_records):
+            # Checked before each duplicate, as the copy loop checks before
+            # each file: the one in progress finishes, nothing further starts.
+            # Previously cancellation was read only before entering cleanup,
+            # so every remaining duplicate was still deleted after Cancel.
+            if cancel_requested.is_set():
+                was_cancelled = True
+                remaining = duplicate_records[index:]
+                logger.warning(f"Cancellation requested — {len(remaining)} duplicate(s) left in "
+                               f"place and recorded as Cancelled.")
+                for cancelled_id, cancelled_src, _ in remaining:
+                    log_operation(conn, run_id, cancelled_id, cancelled_src, None,
+                                  OPERATION_CANCELLED, commit=False)
+                conn.commit()
+                break
+
             dup_src = Path(dup_src_str)
             if not dup_src.exists():
                 continue  # already gone (e.g. handled in a prior run)
@@ -3024,28 +3222,39 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
                               PhotoStatus.FAILED, error_message)
                 continue
 
+            # Intent before the delete, with dest_path naming the copy that
+            # verified. That pointer is also how reconciliation tells an
+            # interrupted duplicate removal (the destination belongs to another
+            # row) from an interrupted move of a row's own file.
+            cursor.execute("UPDATE photos SET status = ?, dest_path = ? WHERE id = ?",
+                           (PhotoStatus.PROCESSING, verified, record_id))
+            conn.commit()
             try:
                 _remove_verified_source(dup_src, Path(verified), source_identity,
                                         f"Deleting verified duplicate {dup_src.name}")
             except Exception as e:
                 # Recorded like a verification failure, for the same reason:
                 # the source stays, and the operations row is the only thing
-                # the Error Center can read to say why.
+                # the Error Center can read to say why. The source is still
+                # there, so the row goes back to Duplicate.
                 if isinstance(e, SourceRemovalRefused):
                     error_message = f"Source kept: {e}"
                 else:
                     error_message = f"Duplicate removal failed: {type(e).__name__}: {e}"
                 logger.warning(f"{error_message} — {dup_src}")
+                cursor.execute("UPDATE photos SET status = ? WHERE id = ?",
+                               (PhotoStatus.DUPLICATE, record_id))
                 log_operation(conn, run_id, record_id, dup_src_str, verified,
-                              PhotoStatus.FAILED, error_message)
+                              PhotoStatus.FAILED, error_message, commit=False)
+                conn.commit()
                 continue
             cursor.execute("UPDATE photos SET status = ?, dest_path = ? WHERE id = ?",
                            (PhotoStatus.REMOVED_DUPLICATE, verified, record_id))
+            log_operation(conn, run_id, record_id, dup_src_str, verified,
+                          PhotoStatus.REMOVED_DUPLICATE, commit=False)
             conn.commit()
             removed_count += 1
             logger.info(f"Removed duplicate source file: {dup_src} (verified copy at {verified})")
-            log_operation(conn, run_id, record_id, dup_src_str, verified,
-                          PhotoStatus.REMOVED_DUPLICATE)
 
         if duplicate_records:
             logger.info(f"Duplicate cleanup: removed {removed_count} of {len(duplicate_records)} flagged duplicates.")
