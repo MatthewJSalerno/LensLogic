@@ -1428,6 +1428,58 @@ def the_mtime_fallback_says_files_are_not_changed():
     check("files themselves are not changed" in out, f"the undated-photo note was ambiguous:\n{out}")
 
 
+# ------------------------------------------------------ operational hygiene
+
+@test
+def exiftool_shutdown_is_bounded():
+    """
+    Each worker terminates its ExifTool at exit, and ProcessPoolExecutor waits
+    for every worker, so the wait must be short. PyExifTool's keyword is
+    `timeout`; any other raises TypeError, and falling back to the default
+    quietly restores a 30 s wait per worker.
+    """
+    import inspect
+    import exiftool
+    check("timeout" in inspect.signature(exiftool.ExifTool.terminate).parameters,
+          "the installed PyExifTool's terminate() no longer takes `timeout`")
+    engine = _load_engine()
+    waits = []
+
+    class RecordingExifTool:
+        def terminate(self, timeout=30, _del=False):  # PyExifTool's signature
+            waits.append(timeout)
+
+    engine._worker_exiftool = RecordingExifTool()
+    engine._shutdown_worker_exiftool()
+    check(waits == [5], f"ExifTool shutdown waited {waits} seconds, expected [5]")
+
+
+@test
+def a_large_log_is_rotated_at_startup():
+    case = new_case("log_rotation")
+    make_photo(case / "src" / "a.jpg", "a")
+    logs = case / "appdata" / "logs"
+    logs.mkdir(parents=True)
+    log = logs / "organizer.log"
+
+    log.write_text("earlier run\n")
+    run_engine(case)
+    check(not (logs / "organizer.log.1").exists(), "a small log was rotated")
+    check(log.read_text().startswith("earlier run\n"), "a small log was not appended to")
+
+    # Grow it past the limit. Sparse, so this costs no disk.
+    limit = getattr(_load_engine(), "LOG_ROTATE_BYTES", 50 * 1024 * 1024)
+    with open(log, "r+b") as f:
+        f.truncate(limit + 1)
+    run_engine(case)
+    rotated = logs / "organizer.log.1"
+    check(rotated.exists() and rotated.stat().st_size > limit,
+          f"the oversized log was not rotated: {sorted(p.name for p in logs.iterdir())}")
+    check(log.exists() and log.stat().st_size < 1024 * 1024
+          and "finished with status" in log.read_text(),
+          "the new log does not hold this run")
+
+
 # ---------------------------------------------------------------------- main
 
 def main():
