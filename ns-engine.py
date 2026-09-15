@@ -138,6 +138,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import logging.handlers
 import warnings
 import multiprocessing as mp
 import os
@@ -212,12 +213,9 @@ RASTER_EXTENSIONS = {
     '.tif', '.tiff', '.heic', '.heif', '.avif',
 }
 
-# Derived, never hand-maintained. These two sets used to be written out
-# separately with a comment asking the next editor to keep them in sync — a
-# RAW format added to SUPPORTED_EXTENSIONS but missed in RAW_EXTENSIONS would
-# be discovered by the scan, handed to PIL, and silently store "error" as its
-# perceptual hash for every file of that type. Deriving the union removes the
-# possibility rather than documenting it.
+# Derived, never hand-maintained: a RAW format in SUPPORTED_EXTENSIONS but not
+# RAW_EXTENSIONS would be discovered by the scan, handed to PIL, and silently
+# store "error" as the perceptual hash of every file of that type.
 SUPPORTED_EXTENSIONS = RASTER_EXTENSIONS | RAW_EXTENSIONS
 # The storage engine is named in the file so a second store can sit beside it
 # without ambiguity — Phase 3 may add a DuckDB companion for all-pairs
@@ -248,9 +246,8 @@ DATE_SOURCE_MTIME = "file_mtime"
 # --- Status vocabularies -----------------------------------------------------
 #
 # Every value any of the three tables may hold in its `status` column, named
-# once. These were previously 38 scattered string literals with no enumeration
-# anywhere, which fails in a specific and silent way: SQLite accepted any
-# string, and a misspelling in a WHERE clause matches zero rows rather than
+# once, because scattered literals fail silently: SQLite accepts any string,
+# and a misspelling in a WHERE clause matches zero rows rather than
 # raising. A typo in the duplicate-cleanup anchor check would simply stop
 # removing duplicate sources; a typo in the 'Processing' marker would make
 # crash recovery blind to a file interrupted mid-move. Nothing would error and
@@ -364,13 +361,9 @@ try:
 except ImportError:
     PIL_SUPPORTED = False
 
-# FIX: rawpy added so pHash generation actually works for RAW-family files.
-# Previously compute_phash() only ever tried PIL.Image.open() on every file
-# — PIL cannot decode real RAW sensor data (.raw/.dng/.cr2/.nef/.arw/.raf)
-# at all, so every one of those files silently got the literal string
-# "error" stored as its phash, never a usable hash. This matches what
-# project-spec.md §3.3 already calls for ("rawpy for robust RAW and DNG
-# metadata handling") but which wasn't actually wired in.
+# rawpy decodes RAW-family files (.raw/.dng/.cr2/.nef/.arw/.raf) for the
+# perceptual hash (project-spec.md §3.3). PIL cannot read real sensor data;
+# without rawpy every such file would store "error" as its phash.
 try:
     import rawpy
     RAWPY_SUPPORTED = True
@@ -448,6 +441,26 @@ result_queue = queue.Queue(maxsize=DB_QUEUE_SIZE)
 
 
 # --- Logging Initialization ---
+# The log rotates only at startup, in the process holding the single-instance
+# lock (rotate_log_if_large), never by size mid-write: every worker process
+# holds the same file open, and a rotation by one of them would leave the rest
+# writing into the renamed file. One run's log is therefore never split, and
+# the total is bounded by these plus one run's output.
+LOG_ROTATE_BYTES = 50 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
+
+
+def rotate_log_if_large():
+    """Rotates organizer.log once it exceeds LOG_ROTATE_BYTES. Call only while holding the lock."""
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, logging.handlers.RotatingFileHandler):
+            try:
+                if os.path.getsize(handler.baseFilename) > LOG_ROTATE_BYTES:
+                    handler.doRollover()
+            except OSError as e:
+                logger.warning(f"Could not rotate {handler.baseFilename}: {e}")
+
+
 def configure_logging(log_dir: Path):
     """
     Points logging at the console and <base>/logs/organizer.log.
@@ -478,7 +491,10 @@ def configure_logging(log_dir: Path):
         format='%(asctime)s [%(levelname)s] (pid:%(process)d/%(threadName)s) %(message)s',
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler(log_file, mode="a", encoding="utf-8")
+            # maxBytes=0: never rotates on write; see rotate_log_if_large.
+            logging.handlers.RotatingFileHandler(
+                log_file, mode="a", maxBytes=0, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"
+            )
         ]
     )
 
@@ -926,12 +942,10 @@ def db_writer_worker(db_path: str):
             result_queue.task_done()
             break
 
-        # FIX: the whole body is now wrapped in try/except/finally. A bad row
-        # (or any other unexpected error) used to crash this thread silently;
-        # since the main thread's result_queue.join() waits on task_done()
-        # being called for every item, a dead consumer thread meant the whole
-        # script hung forever with no error surfaced. Now a single bad file
-        # is logged and skipped instead of taking down the run.
+        # The whole body is guarded: main()'s result_queue.join() waits for
+        # task_done() on every item, so an exception escaping this loop would
+        # hang the run with no error surfaced. A bad row is rolled back and
+        # counted in writer_failures instead.
         try:
             # Each scan result is one unit: its catalog row and its audit entry
             # are written together or not at all. The savepoint nests inside
@@ -942,18 +956,14 @@ def db_writer_worker(db_path: str):
                 conn.execute("BEGIN")
             conn.execute("SAVEPOINT scan_row")
 
-            # FIX: exclude the file's own previous row from the duplicate
-            # check ("source_path != ?"), AND exclude rows that are
-            # themselves already Duplicate/Removed_Duplicate. Without the
-            # status exclusion, re-scanning a duplicate pair could cascade:
-            # each file would find the OTHER one's persisted 'Duplicate'
-            # status and count it as "an existing copy elsewhere", flipping
-            # BOTH files to Duplicate with no Pending anchor left for either
-            # — meaning that photo could never be moved, and (since cleanup
-            # only acts on a verified Completed copy) could never be
-            # deleted either. It would sit stuck in source forever. Only a
-            # genuine anchor status (Pending/Processing/Completed/Failed)
-            # should count as "the original."
+            # Exclude the file's own previous row ("source_path != ?") and
+            # rows that are themselves Duplicate/Removed_Duplicate. Without
+            # the status exclusion, re-scanning a duplicate pair would
+            # cascade: each file would find the other's persisted Duplicate
+            # status and count it as the original, leaving both Duplicate
+            # with no anchor, so the photo could never be moved or cleaned
+            # up. normalize_duplicate_groups() re-derives the final
+            # classification after the scan.
             cursor.execute(
                 "SELECT id FROM photos WHERE sha1_hash = ? AND source_path != ? "
                 f"AND status NOT IN ({sql_values((PhotoStatus.DUPLICATE, PhotoStatus.REMOVED_DUPLICATE))})",
@@ -965,12 +975,9 @@ def db_writer_worker(db_path: str):
             if existing and status != PhotoStatus.FAILED:
                 status = PhotoStatus.DUPLICATE
 
-            # FIX: UPSERT on source_path instead of a blind INSERT. This is
-            # the direct fix for the crash — re-scanning a file already
-            # cataloged from a prior run (e.g. re-running an Index, or the
-            # standard Index-then-move sequence) previously violated the
-            # UNIQUE constraint on source_path and killed this thread. Now a
-            # re-scan just refreshes that row's hashes/status in place.
+            # UPSERT on source_path: re-scanning a file already catalogued (a
+            # repeated Index, or Index then Move) refreshes its row in place
+            # rather than violating the UNIQUE constraint.
             cursor.execute(
                 """INSERT INTO photos
                    (source_path, dest_path, sha1_hash, phash, collision_group, is_master, status,
@@ -1032,9 +1039,7 @@ def db_writer_worker(db_path: str):
             # Undo this row's partial writes, keep the rest of the batch, and
             # remember the failure: main() fails the run and skips the
             # physical phase rather than acting on a catalog it could not
-            # update. A status the CHECK constraints reject lands here too,
-            # which is what makes those constraints fail loudly rather than
-            # into a single log line.
+            # update. A status the CHECK constraints reject lands here too.
             with contextlib.suppress(Exception):
                 conn.execute("ROLLBACK TO scan_row")
                 conn.execute("RELEASE scan_row")
@@ -1055,8 +1060,8 @@ def db_writer_worker(db_path: str):
     # under a different TZ. Surfacing the count makes that visible per run
     # instead of being something you discover in the organized tree later.
     # One line that answers "what actually happened?" without reading the whole
-    # log. A real run previously ended with only a file count, so a scan where
-    # hundreds of files failed looked identical to a clean one.
+    # log. A bare file count makes a scan where hundreds of files failed look
+    # identical to a clean one.
     total = sum(status_counts.values())
     if total:
         breakdown = ", ".join(f"{n:,} {st.lower()}" for st, n in sorted(status_counts.items()))
@@ -1158,16 +1163,11 @@ def reconcile_interrupted_state(db_path: Path, run_id: Optional[int] = None):
             if run_id is not None:
                 log_operation(conn, run_id, record_id, src_str, dst_str, final, note, commit=False)
 
-        # FIX: a run that was killed uncatchably (SIGKILL, OOM-kill, power
-        # loss — anything that bypasses main()'s try/finally) never reaches
-        # finish_run(), so its `runs` row is left at status='Running' with
-        # ended_at=NULL forever. Confirmed via testing: a hard-killed process
-        # leaves exactly this state, and it is NOT cleaned up by any
-        # subsequent run without this step — a run-history view would show
-        # a job as perpetually "still running" long after the process that
-        # ran it is gone. Every such row found at startup genuinely cannot
-        # still be running (this new process holds the same DB), so mark it
-        # accordingly.
+        # A run killed uncatchably (SIGKILL, OOM-kill, power loss — anything
+        # that bypasses main()'s try/finally) never reaches finish_run(), so
+        # its row stays Running with no end time. This process holds the
+        # single-instance lock, so no other run can still be alive: mark
+        # them Crashed.
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='runs';")
         if cursor.fetchone():
             # The reconciling run itself is Running and must not mark itself Crashed.
@@ -1309,14 +1309,9 @@ def _shutdown_worker_exiftool():
         try:
             # Bounded: ProcessPoolExecutor's shutdown waits for every worker,
             # and this runs via atexit in each of them, so an ExifTool process
-            # that will not exit stalls the whole run's teardown. PyExifTool
-            # defaults to a 30s wait per instance, which across several workers
-            # and several back-to-back invocations is long enough to look
-            # indistinguishable from a hang.
-            try:
-                _worker_exiftool.terminate(wait_timeout=5)
-            except TypeError:
-                _worker_exiftool.terminate()
+            # that will not exit stalls the whole run's teardown. PyExifTool's
+            # default is a 30 s wait per instance.
+            _worker_exiftool.terminate(timeout=5)
         except Exception:
             pass
         _worker_exiftool = None
@@ -1520,7 +1515,7 @@ def compute_phash(file_path: str) -> str:
 
     ext = Path(file_path).suffix.lower()
 
-    # FIX: RAW-family formats need rawpy to decode at all — PIL can't open
+    # RAW-family formats need rawpy to decode at all — PIL can't open
     # them. Demosaic at half_size for speed, since a perceptual hash only
     # needs a coarse visual fingerprint, not full resolution.
     if ext in RAW_EXTENSIONS:
@@ -2374,6 +2369,10 @@ def main():
     # touching the database or source/dest paths at all. Applies to every
     # mode, including Index, not just --move/--copy.
     lock_fd = acquire_single_instance_lock(base_dir)
+    if lock_fd is not None:
+        # Only the lock holder rotates: a rejected second instance must not
+        # rename the running engine's log out from under it.
+        rotate_log_if_large()
     if lock_fd is None:
         logger.error(
             f"FATAL: another NegativeSpace engine process is already running against --base {base_dir} "
@@ -2384,7 +2383,7 @@ def main():
 
     # 2b. ExifTool is a hard requirement (module docstring) — fail fast and
     # clearly, before touching source/dest/the database at all, rather than
-    # limping along in a degraded PIL-only mode the way earlier versions did.
+    # limping along in a degraded PIL-only mode.
     if not EXIFTOOL_SUPPORTED:
         missing = []
         if not PYEXIFTOOL_PACKAGE_AVAILABLE:
@@ -2595,18 +2594,12 @@ def main():
 
         # Applies to ALL THREE targeting modes, not just the full scan.
         #
-        # This used to sit inside the else branch above, so --file-ids and
-        # --source-subdir runs re-read every targeted file in full — SHA-1,
-        # a pixel decode for the perceptual hash, and an ExifTool pass —
-        # even when the catalog already held an identical, current record.
-        # On a real library that meant a scoped --copy of ~9,500 files spent
-        # about seven minutes pulling ~20 GB over the network before the
-        # first byte was copied, recomputing values it already had.
-        #
-        # Those are exactly the runs the web UI issues: the user picks a
-        # folder or a set of files, never "everything". Skipping unchanged
-        # files here is safe because their rows are already Pending with a
-        # resolved dest_path, which is all the Move/Copy phase reads.
+        # Re-reading an unchanged file costs a full SHA-1, a pixel decode for
+        # the perceptual hash, and an ExifTool pass; over a network share, a
+        # scoped run of ~9,500 files spends minutes on that before the first
+        # byte is copied. Scoped runs are exactly what the web UI issues.
+        # Skipping is safe because an unchanged file's row already holds its
+        # hashes and date, which is all the Move/Copy phase reads.
         files_to_process, unchanged = partition_unchanged(
             str(db_path), candidates, force=args.force_rehash
         )
@@ -2625,9 +2618,9 @@ def main():
         # an entire library up front made peak memory scale with the number of
         # photos (hundreds of MB to GBs on a large collection) no matter how
         # small the queue's maxsize was. Batching also gives cancellation a
-        # checkpoint: previously SIGTERM was not looked at once during the
-        # whole scan, so Cancel Job (and `docker stop`, which escalates to
-        # SIGKILL after ~10s) did nothing at all on a long Index.
+        # checkpoint between batches; without one, Cancel Job (and `docker
+        # stop`, which escalates to SIGKILL after ~10s) could not stop a long
+        # Index.
         scan_batch_size = max(worker_count * 4, 16)
         scanned = 0
         scan_started_at = time.monotonic()
@@ -2745,10 +2738,10 @@ def mark_vanished_sources(db_path: str, run_id: int, root: Path, discovered: Lis
     After a full walk of `root`, marks catalogued Pending/Duplicate files that
     no longer exist as Failed, with a recorded reason. Returns how many.
 
-    A full Index only updates the files it finds, so a photo deleted outside
-    the engine kept its row Pending indefinitely — and went on standing as
-    the original of its duplicate group, so the duplicate was never
-    delivered. Failed rows take no part in duplicate grouping, which lets the
+    A full Index only updates the files it finds, so without this a photo
+    deleted outside the engine would keep its row Pending indefinitely, and
+    go on standing as the original of its duplicate group, so the duplicate
+    would never be delivered. Failed rows take no part in duplicate grouping, which lets the
     reclassification that follows promote a surviving duplicate.
 
     A file counts as gone only when stat() says it does not exist. Anything
@@ -2934,10 +2927,9 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
     )
     pending_records = cursor.fetchall()
 
-    # One stat per file, not two. This used to call exists() and then stat(),
-    # which is two round trips per record on a network share — 52,000 of them
-    # for a 26,000-file pending set, all before any data moves. stat() already
-    # answers both questions, and its failure IS the "missing" case.
+    # One stat per file, not exists() then stat(): on a network share each is a
+    # round trip, all before any data moves. stat() answers both questions, and
+    # its failure IS the "missing" case.
     total_bytes_needed = 0
     missing = 0
     sizes = {}
@@ -2979,9 +2971,8 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
                               OPERATION_CANCELLED)
             break
 
-        # The same recent-rate progress the scan reports. Between its first and
-        # last lines this phase used to say nothing at all, which on a long run
-        # left no way to see its throughput.
+        # The same recent-rate progress the scan reports, so a long transfer
+        # shows its throughput.
         now = time.monotonic()
         if now - last_progress_at >= PROGRESS_INTERVAL_SECONDS:
             log_scan_progress(
@@ -3033,10 +3024,9 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
             # errors it explains makes the log read backwards.
             logger.info(f"Already present at destination, skipping copy: {label} -> {resolved_dst}")
             if args.move:
-                # Intent first, as the copy path does. Deleting before
-                # recording meant a crash in between left the source gone and
-                # the row still claiming it was there; reconciliation settles
-                # rows it finds in Processing from what is actually on disk.
+                # Intent first, as the copy path does, so a crash between the
+                # delete and the final update leaves a Processing row that
+                # reconciliation settles from what is actually on disk.
                 cursor.execute("UPDATE photos SET status = ?, dest_path = ? WHERE id = ?",
                                (PhotoStatus.PROCESSING, resolved_dst, record_id))
                 conn.commit()
@@ -3130,9 +3120,8 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
         # copy was itself never confirmed. Every deletion below additionally
         # requires live bytes on both sides to match — see the verification
         # block.
-        # Scoped to whatever this run targeted. Previously this swept the
-        # WHOLE library regardless: a two-file --file-ids move would happily
-        # delete duplicate source files nowhere near the user's selection.
+        # Scoped to whatever this run targeted: a two-file --file-ids move
+        # must never delete duplicate sources outside the user's selection.
         cursor.execute(
             f"SELECT id, source_path, sha1_hash FROM photos WHERE status = '{PhotoStatus.DUPLICATE}'"
             + predicate,
@@ -3143,8 +3132,6 @@ def _run_move_or_copy(args, db_path: Path, dest_path: Path, run_id: int) -> str:
         for index, (record_id, dup_src_str, sha1_hash) in enumerate(duplicate_records):
             # Checked before each duplicate, as the copy loop checks before
             # each file: the one in progress finishes, nothing further starts.
-            # Previously cancellation was read only before entering cleanup,
-            # so every remaining duplicate was still deleted after Cancel.
             if cancel_requested.is_set():
                 was_cancelled = True
                 remaining = duplicate_records[index:]

@@ -1,5 +1,14 @@
-Pillow>=10.0.0
-pillow-heif>=0.13.0
-imagehash>=4.3.1
-rawpy>=0.19.0
-pyexiftool>=0.5.6
+# Exact versions, so an image built today is the image that was validated.
+# Update deliberately: change a pin, rebuild, run CI, and validate against a
+# real library before merging.
+Pillow==12.3.0
+pillow-heif==1.7.0
+imagehash==4.3.2
+rawpy==0.27.1
+pyexiftool==0.5.6
+
+# Pulled in by the packages above; pinned for the same reason.
+numpy==2.4.6
+scipy==1.17.1
+PyWavelets==1.9.0
+packaging==26.3

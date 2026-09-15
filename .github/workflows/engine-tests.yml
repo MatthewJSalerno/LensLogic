@@ -38,6 +38,11 @@ jobs:
             exit 1
           fi
 
+      - name: Entrypoint ownership
+        # Runs on the host: it checks what the entrypoint does to real bind
+        # mounts, which the suite (running after the entrypoint) cannot see.
+        run: sh tests/entrypoint_test.sh
+
       - name: Smoke suite
         # PUID/PGID drop privileges, which is what lets the permission test run
         # at all — as root it skips, and a test that always skips is
