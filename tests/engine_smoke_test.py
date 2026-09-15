@@ -1243,6 +1243,191 @@ def transfer_lines_name_the_source_path():
     check("trip/IMG_0001.jpg ->" in out, f"the transfer line did not name the path under the source:\n{out}")
 
 
+# ------------------------------------------------------- truthful outcomes
+#
+# Every selected file, every failure and every interruption must leave a
+# durable record, and a run must not report success it did not achieve.
+
+@test
+def a_lost_catalog_write_fails_the_run():
+    """If scan results cannot be recorded, the run fails and no file is moved or copied."""
+    # The writer logged a rejected row and carried on, so a run whose catalog
+    # writes were refused still reported Completed, exited 0 — and then moved
+    # or copied files against a catalog it had failed to update.
+    case = new_case("writer_failure")
+    make_photo(case / "src" / "one.jpg", "ONE")
+    run_engine(case)
+    conn = db(case)
+    try:
+        conn.execute("CREATE TRIGGER reject BEFORE INSERT ON photos "
+                     "BEGIN SELECT RAISE(ABORT, 'injected'); END;")
+        conn.commit()
+    finally:
+        conn.close()
+    make_photo(case / "src" / "two.jpg", "TWO")
+    out = engine_output(run_engine(case, "--copy", expect_rc=1))
+    run = rows(case, "SELECT status FROM runs ORDER BY id DESC LIMIT 1")[0]
+    check(run["status"] == "Failed", f"the run should be Failed, got {run['status']}")
+    check(dest_files(case) == [],
+          f"files were copied although the catalog could not be updated: {dest_files(case)}")
+    check("could not be recorded" in out, f"the failure was not explained:\n{out}")
+
+
+@test
+def an_unreadable_folder_is_recorded_not_just_logged():
+    """A folder the scan cannot read becomes a recorded failure for the run, not only a log line."""
+    if os.geteuid() == 0:
+        raise Fail("SKIP: running as root, permission checks are bypassed")
+    case = new_case("unreadable_dir")
+    make_photo(case / "src" / "ok.jpg", "OK")
+    locked = case / "src" / "locked"
+    make_photo(locked / "inside.jpg", "INSIDE")
+    locked.chmod(0o000)
+    try:
+        run_engine(case)
+    finally:
+        locked.chmod(0o755)
+    failures = rows(case, "SELECT photo_id, source_path, error_message FROM operations "
+                          "WHERE status = 'Failed'")
+    check(any(f["photo_id"] is None and f["source_path"].endswith("/src/locked") for f in failures),
+          f"the unreadable folder left no recorded failure: {failures}")
+
+
+@test
+def a_vanished_original_frees_its_duplicate():
+    """A full Index notices a catalogued file that is gone and stops treating it as an original."""
+    # A photo deleted outside the engine kept its row Pending forever, because
+    # a full Index only updates the files it finds. That row went on standing
+    # as the original of its duplicate group, so the duplicate was never
+    # delivered — exactly what a misplaced, later-deleted test copy did to a
+    # real library.
+    case = new_case("vanished_anchor")
+    make_photo(case / "src" / "a.jpg", "TWIN")
+    make_photo(case / "src" / "b.jpg", "TWIN")
+    run_engine(case)
+    anchor = rows(case, "SELECT id, source_path FROM photos WHERE status = 'Pending'")[0]
+    Path(anchor["source_path"]).unlink()
+    run_engine(case, "--move")
+    check(src_files(case) == [], f"the surviving duplicate was not delivered: {src_files(case)}")
+    check(len(dest_files(case)) == 1, f"expected the one photo delivered, got {dest_files(case)}")
+    gone = rows(case, "SELECT status FROM photos WHERE id = ?", (anchor["id"],))[0]
+    check(gone["status"] == "Failed", f"the vanished file's row should be Failed, got {gone['status']}")
+
+
+@test
+def cancelling_stops_duplicate_cleanup():
+    """Cancel during duplicate cleanup lets the current file finish and leaves the rest untouched."""
+    engine = _load_engine()
+    case = new_case("cancel_cleanup")
+    for name in ("a.jpg", "b.jpg", "c.jpg"):
+        make_photo(case / "src" / name, "TRIPLET")
+    run_engine(case)
+    anchor = rows(case, "SELECT id FROM photos WHERE status = 'Pending'")[0]["id"]
+    run_engine(case, "--move", "--file-ids", anchor)
+    real_remove = engine._remove_verified_source
+
+    def remove_then_cancel(*args, **kwargs):
+        real_remove(*args, **kwargs)
+        engine.cancel_requested.set()
+
+    engine._remove_verified_source = remove_then_cancel
+    args = argparse.Namespace(move=True, copy=False, source=str(case / "src"),
+                              source_subdir=None, file_ids=None)
+    outcome = engine._run_move_or_copy(args, case / "appdata" / "db" / "ns_sqlite.db",
+                                       case / "dest", 999)
+    check(outcome == "Cancelled", f"cleanup ignored the cancellation and returned {outcome}")
+    check(len(src_files(case)) == 1,
+          f"expected one duplicate kept after cancelling, source holds {src_files(case)}")
+    cancelled = rows(case, "SELECT COUNT(*) AS c FROM operations "
+                           "WHERE run_id = 999 AND status = 'Cancelled'")[0]["c"]
+    check(cancelled == 1, f"the unstarted duplicate was not recorded as Cancelled ({cancelled})")
+
+
+@test
+def an_interrupted_delete_is_recovered_on_the_next_run():
+    """A crash between deleting a source and recording it is reconciled truthfully by the next run."""
+    # The copy path marks a row Processing before touching the filesystem, but
+    # the already-present path and duplicate cleanup deleted first and
+    # recorded after. A crash in between left the source gone and the row
+    # claiming otherwise, with no operation saying what had happened.
+    engine = _load_engine()
+    real_remove = engine._remove_verified_source
+
+    def remove_then_die(*args, **kwargs):
+        real_remove(*args, **kwargs)
+        raise KeyboardInterrupt("simulated crash after the source was deleted")
+
+    def crash_during_move(case):
+        engine._remove_verified_source = remove_then_die
+        args = argparse.Namespace(move=True, copy=False, source=str(case / "src"),
+                                  source_subdir=None, file_ids=None)
+        try:
+            engine._run_move_or_copy(args, case / "appdata" / "db" / "ns_sqlite.db", case / "dest", 999)
+            raise Fail("the simulated crash did not happen")
+        except KeyboardInterrupt:
+            pass
+        finally:
+            engine._remove_verified_source = real_remove
+
+    # 1. Already present: a --copy delivered the file, so --move only deletes.
+    case = new_case("crash_after_unlink")
+    make_photo(case / "src" / "a.jpg", "A")
+    run_engine(case, "--copy")
+    crash_during_move(case)
+    run_engine(case)
+    check(status_of(case, "a.jpg") == "Completed",
+          f"expected Completed after recovery, got {status_of(case, 'a.jpg')}")
+    recovered = rows(case, "SELECT error_message FROM operations WHERE status = 'Completed' "
+                           "AND run_id = (SELECT MAX(id) FROM runs)")
+    check(recovered and "interrupted" in (recovered[0]["error_message"] or ""),
+          f"the recovery was not recorded by the run that performed it: {recovered}")
+
+    # 2. Duplicate cleanup.
+    case = new_case("crash_after_dup_unlink")
+    make_photo(case / "src" / "a.jpg", "TWIN")
+    make_photo(case / "src" / "b.jpg", "TWIN")
+    run_engine(case)
+    anchor = rows(case, "SELECT id FROM photos WHERE status = 'Pending'")[0]["id"]
+    dup = rows(case, "SELECT id FROM photos WHERE status = 'Duplicate'")[0]["id"]
+    run_engine(case, "--move", "--file-ids", anchor)
+    crash_during_move(case)
+    run_engine(case)
+    final = rows(case, "SELECT status FROM photos WHERE id = ?", (dup,))[0]["status"]
+    check(final == "Removed_Duplicate", f"expected Removed_Duplicate after recovery, got {final}")
+
+
+@test
+def invalid_input_exits_non_zero():
+    """A missing or non-directory --source, or a non-positive --workers, is an error — not a quiet success."""
+    case = new_case("bad_input")
+    make_photo(case / "src" / "a.jpg", "A")
+    run_engine(case, "--source", case / "does-not-exist", expect_rc=1)
+    run_engine(case, "--source", case / "src" / "a.jpg", expect_rc=1)
+    run_engine(case, "--workers", "0", expect_rc=2)
+    run_engine(case, "--workers", "-3", expect_rc=2)
+
+
+@test
+def an_empty_test_filter_fails():
+    """The suite refuses a --filter matching no test instead of passing vacuously."""
+    proc = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--engine", str(ENGINE),
+                           "--filter", "no_test_has_this_name"],
+                          capture_output=True, text=True, timeout=120)
+    check(proc.returncode != 0, f"a filter matching nothing reported success:\n{proc.stdout}")
+
+
+@test
+def the_mtime_fallback_says_files_are_not_changed():
+    """The note about undated photos says plainly that only folder placement uses the mtime."""
+    # "Filed by modification time" read to a real user as if the engine were
+    # rewriting dates. It never modifies a file; the mtime only picks the
+    # YYYY/MM/DD folder.
+    case = new_case("mtime_wording")
+    make_photo(case / "src" / "a.jpg", "A", date=None)
+    out = engine_output(run_engine(case))
+    check("files themselves are not changed" in out, f"the undated-photo note was ambiguous:\n{out}")
+
+
 # ---------------------------------------------------------------------- main
 
 def main():
@@ -1276,6 +1461,12 @@ def main():
     print(f"workspace : {WORKSPACE}\n")
 
     selected = [t for t in RESULTS if args.filter in t.__name__]
+    if not selected:
+        # A typo'd filter used to print "0 passed, 0 failed" and exit 0 —
+        # indistinguishable from success to anything reading the exit code.
+        print(f"no test name contains {args.filter!r}", file=sys.stderr)
+        shutil.rmtree(WORKSPACE, ignore_errors=True)
+        return 2
     passed = failed = skipped = 0
     failures = []
 
