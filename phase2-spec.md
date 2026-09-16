@@ -329,9 +329,19 @@ Preventing the situation is the UI's job:
 
 The general principle: the engine guarantees it will never act on something it has not catalogued, and says so when a selection resolves to nothing. The UI is responsible for making an empty selection hard to construct in the first place.
 
-### 5.9 Reclaimable Space from Duplicates
+### 5.9 Duplicate Space: Reclaimable, Reclaimed, and Saved
 
-"How much space are my duplicates wasting?" is a headline figure for the Dashboard, and the catalog already answers it without any engine change.
+"How much space are my duplicates wasting?" is a headline figure for the Dashboard, and the catalog already answers it without any engine change. Deduplication acts on two different volumes, though, and conflating them produces a number that is wrong in whichever direction the user's mode does not apply:
+
+| Figure | Where | Realized by |
+| :--- | :--- | :--- |
+| **Reclaimable** — duplicate sources still on disk | Source | `--move` only |
+| **Reclaimed** — duplicate sources already deleted | Source | Past `--move` runs |
+| **Saved** — duplicate copies never written | Destination | `--move` *and* `--copy` |
+
+**These are not addends.** A Move both deletes a duplicate source and declines to write it to the destination, so the same bytes appear under *Reclaimed* and under *Saved*. Summing them into one "total saved" double-counts every moved duplicate. Show them as separate figures, each labelled with the volume it refers to.
+
+#### Reclaimable at the source
 
 **The waste is every copy beyond the one that is kept, not the whole group.** Three copies of one photo waste two copies' worth of bytes; the third is the photo itself, which the user is keeping. Deduplication already encodes exactly that split: among rows sharing a `sha1_hash`, one is the anchor (`Pending`, or `Copied`/`Completed` once delivered) and every other is `Duplicate`. So the figure is a single aggregate over the rows that are *not* anchors:
 
@@ -348,10 +358,30 @@ No `GROUP BY`, no "subtract one per group" arithmetic, and no risk of the off-by
 
 **Four things not to fold into the figure:**
 
-* **`Removed_Duplicate` is already reclaimed**, not reclaimable. Those source files are gone. Report it separately if at all — as a "space recovered so far" figure, which is history rather than an opportunity, and which double-counts the moment it is added to the number above.
-* **The destination is out of scope.** The engine never deletes anything under `--dest`; redundancy *there* is reported rather than resolved, and only in Phase 3 (`phase3-spec.md` §3). This figure is about the source tree.
+* **`Removed_Duplicate` is already reclaimed**, not reclaimable. Those source files are gone, so they are the *Reclaimed* figure — history rather than an opportunity — and adding them here double-counts. They also count toward the destination saving below, which is a different volume, not a second helping of the same one.
+* **No destination deletion is implied.** The engine never deletes anything under `--dest`. Redundancy that something outside the engine put there is reported, not resolved, and only in Phase 3 (`phase3-spec.md` §3). This figure covers source files the engine can remove; what deduplication saves at the destination is the separate figure below.
 * **`Failed` rows are not duplicates.** A source that vanished outside NegativeSpace is marked `Failed` at the next full Index, which removes it from its duplicate group and lets a surviving copy be promoted to anchor. It therefore drops out of this figure automatically — correct, since deleting a file that no longer exists reclaims nothing.
 * **Sizes are as of the last scan.** `file_size` is recorded by the Index that wrote the row (§6.1), so the total is as current as the catalog. Show it alongside the last scan time, as §5.8 asks of folder counts, so a stale figure reads as stale rather than as wrong.
+
+#### Space saved at the destination
+
+The figures above are about the source tree, which is why only Move realizes them. **Deduplication's benefit to `--copy` is entirely at the destination:** a duplicate is never written there, so the destination holds one copy of each distinct photo instead of N. That saving is real in both modes, and it is the *only* one a Copy user gets.
+
+A duplicate has saved destination space once its content has actually been delivered — that is, once some other row in its group is `Copied` or `Completed`:
+
+```sql
+SELECT COUNT(*)                      AS copies_not_written,
+       COALESCE(SUM(d.file_size), 0) AS bytes_not_written
+FROM photos d
+WHERE d.status IN ('Duplicate', 'Removed_Duplicate')
+  AND EXISTS (SELECT 1 FROM photos a
+              WHERE a.sha1_hash = d.sha1_hash AND a.id != d.id
+                AND a.status IN ('Copied', 'Completed'));
+```
+
+Both statuses count, because neither was ever written to the destination: a `Duplicate` still sits in the source, a `Removed_Duplicate` has been deleted from it, and in both cases the destination holds one copy rather than two. The `EXISTS` clause is what makes this *saved* rather than *savable* — a duplicate whose original has not been delivered yet has saved nothing so far, and belongs in the reclaimable figure instead.
+
+What this is not: re-running a Copy does not write files it already delivered (§2's content-aware skip), but that is idempotency, not deduplication. Those rows are the anchors themselves, and the query excludes them by construction. Redundancy that something outside the engine put in the destination is a different question again, answered by the Phase 3 inventory (`phase3-spec.md` §3), not here.
 
 The Inspector's `duplicates` array (§6.2, `GET /api/v1/photos/{id}/inspect`) should carry each copy's `file_size` for the same reason, so a single photo's panel can show what removing its duplicates would reclaim.
 
@@ -639,20 +669,24 @@ Fetches failed attempts for the Error Center (§5.3), filtering on `operations.s
 
 GET /api/v1/stats/duplicates
 
-Backs the Dashboard's reclaimable-space tile (§5.9). One aggregate over `photos` rows whose status is `Duplicate` — the copies beyond the one being kept — plus, separately, what past Move runs have already reclaimed. `last_indexed_at` comes from the most recent completed run, so the UI can label the figure's age rather than implying it is live.
+Backs the Dashboard's duplicate-space tiles (§5.9). Three separate figures, each naming the volume it applies to: what Move could still reclaim from the source, what past Moves already reclaimed from it, and what was never written to the destination in either mode. They overlap by design — a moved duplicate appears in both `already_reclaimed` and `saved_at_destination` — so the API returns them separately and the UI must not total them. `last_indexed_at` comes from the most recent completed run, so the UI can label the figures' age rather than implying they are live.
 
     Response:
     JSON
 
     {
-      "reclaimable": {
+      "reclaimable_at_source": {
         "duplicate_files": 3028,
         "duplicate_groups": 1510,
         "bytes": 6871947673
       },
-      "already_reclaimed": {
+      "already_reclaimed_at_source": {
         "removed_duplicates": 12,
         "bytes": 41943040
+      },
+      "saved_at_destination": {
+        "copies_not_written": 3040,
+        "bytes": 6913890713
       },
       "last_indexed_at": "2026-02-14T10:30:00Z"
     }
