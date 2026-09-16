@@ -329,6 +329,32 @@ Preventing the situation is the UI's job:
 
 The general principle: the engine guarantees it will never act on something it has not catalogued, and says so when a selection resolves to nothing. The UI is responsible for making an empty selection hard to construct in the first place.
 
+### 5.9 Reclaimable Space from Duplicates
+
+"How much space are my duplicates wasting?" is a headline figure for the Dashboard, and the catalog already answers it without any engine change.
+
+**The waste is every copy beyond the one that is kept, not the whole group.** Three copies of one photo waste two copies' worth of bytes; the third is the photo itself, which the user is keeping. Deduplication already encodes exactly that split: among rows sharing a `sha1_hash`, one is the anchor (`Pending`, or `Copied`/`Completed` once delivered) and every other is `Duplicate`. So the figure is a single aggregate over the rows that are *not* anchors:
+
+```sql
+SELECT COUNT(*)                  AS duplicate_files,
+       COUNT(DISTINCT sha1_hash) AS duplicate_groups,
+       COALESCE(SUM(file_size), 0) AS reclaimable_bytes
+FROM photos WHERE status = 'Duplicate';
+```
+
+No `GROUP BY`, no "subtract one per group" arithmetic, and no risk of the off-by-one that counting whole groups invites. `idx_photos_status` backs it, so it stays a cheap query on a large catalog.
+
+**Call it reclaimable, not wasted, and say what reclaims it.** A `Duplicate` row means the redundant source file is still on disk. Only `--move` deletes those (duplicate cleanup, after verifying a destination copy still matches live); `--copy` deliberately removes nothing and records `Skipped` for them, per §5.3. A Dashboard tile reading *"3,028 duplicate files across 1,510 photos — 6.4 GB reclaimable by Move"* is honest about both the number and the action that realizes it. Phrasing it as space the app will "save" invites the user to expect Copy to free it.
+
+**Four things not to fold into the figure:**
+
+* **`Removed_Duplicate` is already reclaimed**, not reclaimable. Those source files are gone. Report it separately if at all — as a "space recovered so far" figure, which is history rather than an opportunity, and which double-counts the moment it is added to the number above.
+* **The destination is out of scope.** The engine never deletes anything under `--dest`; redundancy *there* is reported rather than resolved, and only in Phase 3 (`phase3-spec.md` §3). This figure is about the source tree.
+* **`Failed` rows are not duplicates.** A source that vanished outside NegativeSpace is marked `Failed` at the next full Index, which removes it from its duplicate group and lets a surviving copy be promoted to anchor. It therefore drops out of this figure automatically — correct, since deleting a file that no longer exists reclaims nothing.
+* **Sizes are as of the last scan.** `file_size` is recorded by the Index that wrote the row (§6.1), so the total is as current as the catalog. Show it alongside the last scan time, as §5.8 asks of folder counts, so a stale figure reads as stale rather than as wrong.
+
+The Inspector's `duplicates` array (§6.2, `GET /api/v1/photos/{id}/inspect`) should carry each copy's `file_size` for the same reason, so a single photo's panel can show what removing its duplicates would reclaim.
+
 ---
 
 ## 6. Database Schema & API Specifications
@@ -610,6 +636,26 @@ Returns inspector details for a specific photo.
 GET /api/v1/operations?status=Failed
 
 Fetches failed attempts for the Error Center (§5.3), filtering on `operations.status`. Returns the operation ID, photo ID (nullable), run ID, timestamp, source and destination paths, status, error message, and the associated photo's current status as a separate field — the two are not interchangeable, per §5.3. Left-join the photo so a missing row cannot hide a failure. Supports run and date filters with stable ordering for pagination.
+
+GET /api/v1/stats/duplicates
+
+Backs the Dashboard's reclaimable-space tile (§5.9). One aggregate over `photos` rows whose status is `Duplicate` — the copies beyond the one being kept — plus, separately, what past Move runs have already reclaimed. `last_indexed_at` comes from the most recent completed run, so the UI can label the figure's age rather than implying it is live.
+
+    Response:
+    JSON
+
+    {
+      "reclaimable": {
+        "duplicate_files": 3028,
+        "duplicate_groups": 1510,
+        "bytes": 6871947673
+      },
+      "already_reclaimed": {
+        "removed_duplicates": 12,
+        "bytes": 41943040
+      },
+      "last_indexed_at": "2026-02-14T10:30:00Z"
+    }
 
 `GET /api/v1/photos?status=Failed` remains available for filtering the catalog, but it is not the Error Center's data source: it misses any failure whose photo is not currently `Failed`. "Retrying" is selecting the associated photo IDs and calling `POST /api/v1/jobs/start` again with the same mode — no separate retry endpoint, per the design note in §5.3.
 
